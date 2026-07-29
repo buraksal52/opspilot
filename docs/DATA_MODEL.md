@@ -1,0 +1,878 @@
+# OpsPilot — Data Model
+
+## 1. Purpose
+
+This document defines the initial conceptual data model for OpsPilot.
+
+The model should support:
+
+* users and workspaces,
+* uploaded data sources,
+* structured datasets,
+* documents,
+* document chunks,
+* investigations,
+* investigation steps,
+* tool executions,
+* evidence,
+* AI execution metadata.
+
+This document describes the domain model.
+
+Exact ORM implementation may evolve.
+
+---
+
+# 2. Core Entity Relationships
+
+```text
+User
+  │
+  └── Workspace
+        │
+        ├── DataSource
+        │     ├── Document
+        │     │     └── DocumentChunk
+        │     │
+        │     └── Dataset
+        │
+        └── Investigation
+              ├── InvestigationStep
+              │      └── ToolExecution
+              │
+              └── Evidence
+```
+
+---
+
+# 3. User
+
+Represents an application user.
+
+## Fields
+
+```text
+id
+email
+hashed_password
+display_name
+created_at
+updated_at
+```
+
+Per ADR-019, `hashed_password` stores only an Argon2 hash (via pwdlib). Plaintext passwords are never persisted, logged, or retained anywhere. Access tokens are stateless JWTs (via PyJWT) and are not persisted server-side, so no session/token table exists in V1.
+
+Do not overbuild identity management for V1 — no roles, no social-login fields, no SSO fields.
+
+---
+
+# 4. Workspace
+
+Represents the business context containing data and investigations.
+
+## Fields
+
+```text
+id
+name
+slug
+owner_id
+created_at
+updated_at
+```
+
+## Relationships
+
+A workspace contains:
+
+* data sources,
+* documents,
+* datasets,
+* investigations.
+
+Even if the demo uses one workspace, retaining this concept keeps data boundaries explicit.
+
+Per ADR-019, `owner_id` is the entire V1 authorization model: a request may access a workspace's resources only if the authenticated user matches `owner_id`. No membership/role entity exists yet — multi-member workspaces remain a future extension (SECURITY.md §6).
+
+---
+
+# 5. DataSource
+
+Represents an uploaded or connected source.
+
+Initial source types:
+
+```text
+CSV
+PDF
+MARKDOWN
+TEXT
+```
+
+Future source types may include external integrations.
+
+## Fields
+
+```text
+id
+workspace_id
+
+name
+source_type
+
+original_filename
+mime_type
+file_size_bytes
+
+status
+error_message
+
+metadata
+
+created_at
+updated_at
+processed_at
+```
+
+## Status
+
+Possible values:
+
+```text
+UPLOADED
+PROCESSING
+READY
+FAILED
+DELETED
+```
+
+## Notes
+
+DataSource represents the original source.
+
+## V1 Cardinality
+
+For V1, cardinality between DataSource and its processed output is fixed and 1:1:
+
+* one unstructured DataSource (PDF, Markdown, plain text) produces exactly one Document,
+* one CSV DataSource produces exactly one Dataset.
+
+A DataSource never produces both a Document and a Dataset, and never produces more than one of either in V1. Re-uploading a file creates a new DataSource (and therefore a new Document/Dataset), not a new version of an existing one. Multi-output DataSources (e.g. a single upload producing multiple derived datasets) are explicitly out of scope until a future version demonstrates a real need.
+
+---
+
+# 6. Document
+
+Represents an unstructured or semi-structured text document.
+
+Examples:
+
+* Refund Policy.pdf
+* Shipping Policy.pdf
+* Incident Report.md
+
+## Fields
+
+```text
+id
+workspace_id
+data_source_id
+
+title
+document_type
+
+text_content
+
+page_count
+language
+
+metadata
+
+created_at
+updated_at
+```
+
+## Notes
+
+Raw extracted text may be retained for reprocessing.
+
+Large raw files should not necessarily be stored directly in the database.
+
+---
+
+# 7. DocumentChunk
+
+Represents a retrievable document segment.
+
+## Fields
+
+```text
+id
+workspace_id
+document_id
+
+chunk_index
+content
+
+page_number
+section_title
+
+token_count
+
+embedding
+embedding_model
+embedding_version
+
+metadata
+
+created_at
+```
+
+`embedding_model` and `embedding_version` are explicit first-class fields, not values buried inside `metadata`. They identify which provider/model/version produced the stored vector so that re-indexing after a model change can be performed intentionally rather than silently mixing incompatible vector spaces (see RAG_SYSTEM.md §14).
+
+## Important Metadata
+
+Where possible preserve:
+
+* page,
+* section,
+* source title,
+* paragraph location,
+* original character offsets.
+
+Evidence quality depends on source traceability.
+
+---
+
+# 8. Dataset
+
+Represents an uploaded structured dataset.
+
+Examples:
+
+* orders.csv
+* customers.csv
+* refunds.csv
+* support_tickets.csv
+
+## Fields
+
+```text
+id
+workspace_id
+data_source_id
+
+name
+description
+
+physical_table_name
+
+row_count
+column_count
+
+schema_definition
+profile_statistics
+
+status
+
+created_at
+updated_at
+```
+
+## Physical vs. Display Naming
+
+`name` is the user-facing display name (derived from the original upload, e.g. "orders.csv" → "orders"). It is untrusted display text only and must never be used to construct SQL.
+
+`physical_table_name` is generated by the application (e.g. a naming scheme incorporating the Dataset's own UUID) and identifies the actual PostgreSQL table under the `analytics` schema, per ADR-017. It is never derived from the user-provided filename or CSV header text.
+
+The same distinction applies at the column level: each column in `schema_definition` carries both a `display_name` (from the original CSV header, untrusted) and a `physical_name` (application-generated, sanitized). Generated SQL and DDL reference only `physical_table_name`/`physical_name` values; `name`/`display_name` are for UI presentation only.
+
+## schema_definition
+
+Should describe columns, including both display and physical identifiers.
+
+Example:
+
+```json
+{
+  "order_id": {
+    "display_name": "order_id",
+    "physical_name": "col_1",
+    "type": "string",
+    "nullable": false
+  },
+  "order_date": {
+    "display_name": "order_date",
+    "physical_name": "col_2",
+    "type": "date",
+    "nullable": false
+  },
+  "amount": {
+    "display_name": "amount",
+    "physical_name": "col_3",
+    "type": "decimal",
+    "nullable": false
+  }
+}
+```
+
+The outer JSON key remains the display name for readability in this document; the authoritative physical identifier is always the `physical_name` value.
+
+## profile_statistics
+
+May contain:
+
+* null rates,
+* min/max,
+* unique count,
+* numeric summaries,
+* common categorical values.
+
+---
+
+# 9. Structured Dataset Storage Strategy
+
+V1 should not store every CSV row inside one JSON column.
+
+Structured business data should remain queryable using SQL.
+
+Per ADR-017, each uploaded Dataset is materialized into its own generated PostgreSQL table under the `analytics` schema — one physical table per Dataset record, not one shared table per business concept.
+
+Example (illustrative; actual generated names are opaque application-assigned identifiers, not literal business-concept names):
+
+```text
+analytics.ds_3f9a1c2e   -- physical_table_name for the "orders" Dataset in workspace A
+analytics.ds_7b21e0aa   -- physical_table_name for the "orders" Dataset in workspace B
+analytics.ds_9c44f118   -- physical_table_name for the "customers" Dataset in workspace A
+```
+
+This is why two workspaces can each upload their own `orders.csv` without collision: each upload becomes its own Dataset record with its own generated physical table, never a shared `analytics.orders` table.
+
+Dataset records map application metadata (display name, schema, profile statistics) to these physical tables via `physical_table_name`.
+
+---
+
+# 10. Analytics Schema Isolation
+
+Application tables and uploaded analytical data are separated using schemas. This was decided in ADR-009:
+
+```text
+app.*        — OpsPilot application entities
+analytics.*  — business datasets (one physical table per Dataset, per ADR-017)
+```
+
+Reasons:
+
+* clearer security boundary,
+* easier read-only permissions,
+* workspace-scoped table allowlisting is possible because each Dataset's physical table is individually tracked (ADR-017), rather than relying on a fixed list of shared table names,
+* easier analytics inspection.
+
+This naming and per-Dataset table strategy is settled (ADR-009, ADR-017) and should not be treated as an open question elsewhere in this document set.
+
+---
+
+# 11. Dataset Relationship Metadata
+
+OpsPilot may need to understand relationships between datasets.
+
+Examples:
+
+```text
+orders.customer_id → customers.customer_id
+
+refunds.order_id → orders.order_id
+
+support_tickets.customer_id → customers.customer_id
+```
+
+A future entity may explicitly model these relationships.
+
+For V1, they may be stored inside dataset metadata if sufficient.
+
+Avoid prematurely building a full semantic-layer platform.
+
+---
+
+# 12. Investigation
+
+The central business workflow entity.
+
+Represents one business question and its investigation.
+
+## Fields
+
+```text
+id
+workspace_id
+
+query
+
+status
+
+plan
+
+summary
+conclusion
+recommendations
+
+confidence
+
+started_at
+completed_at
+
+created_at
+updated_at
+```
+
+`confidence` is a structured JSON field (matching the Investigation Result Structure in §22), not a single scalar. It holds the measurable signals the confidence model is built from (evidence coverage, source agreement, analytical support, retrieval quality, contradiction signals — see AGENT_SYSTEM.md §29) plus a derived overall value. The LLM never assigns this value directly; it is computed by the application from those signals. There is no separate `confidence_score` column — an overall figure, if needed for sorting/filtering, is read from `confidence.overall` rather than duplicated into its own column.
+
+## Status
+
+```text
+CREATED
+PLANNING
+RUNNING
+SYNTHESIZING
+COMPLETED
+FAILED
+CANCELLED
+```
+
+## Notes
+
+Do not rely solely on the final answer.
+
+The system should persist enough state to inspect how the conclusion was reached.
+
+---
+
+# 13. InvestigationStep
+
+Represents a meaningful step in an investigation plan.
+
+Example:
+
+```text
+Analyze refund trends
+Search shipping-related tickets
+Review internal shipping documentation
+Calculate revenue impact
+```
+
+## Fields
+
+```text
+id
+investigation_id
+
+sequence_number
+
+step_type
+title
+description
+
+status
+
+input_data
+output_data
+
+started_at
+completed_at
+
+created_at
+```
+
+## Status
+
+```text
+PENDING
+RUNNING
+COMPLETED
+FAILED
+SKIPPED
+```
+
+---
+
+# 14. ToolExecution
+
+Represents a controlled tool invocation.
+
+Examples:
+
+* document search,
+* database query,
+* metric calculation.
+
+## Fields
+
+```text
+id
+investigation_id
+investigation_step_id
+
+tool_name
+
+input_data
+output_data
+
+status
+
+duration_ms
+
+error_type
+error_message
+
+created_at
+started_at
+completed_at
+```
+
+## Status
+
+```text
+PENDING
+RUNNING
+COMPLETED
+FAILED
+```
+
+## Important
+
+ToolExecution exists for:
+
+* debugging,
+* observability,
+* evidence tracking,
+* auditing agent behavior.
+
+---
+
+# 15. Evidence
+
+Represents information supporting a finding or conclusion.
+
+## Fields
+
+```text
+id
+workspace_id
+investigation_id
+investigation_step_id
+tool_execution_id
+
+evidence_type
+
+title
+content
+
+source_type
+source_reference
+
+metadata
+
+created_at
+```
+
+## Evidence Types
+
+Potential values:
+
+```text
+DOCUMENT
+DATABASE_QUERY
+METRIC
+ANALYSIS
+```
+
+## Evidence Retention
+
+`content` (and the type-specific fields under `metadata`, e.g. the query result preview or the document excerpt) is a **bounded snapshot** captured at the moment the evidence is created during the investigation — not a live pointer that is re-resolved later.
+
+This means:
+
+* deleting the underlying DataSource/Document/Dataset afterward does not remove or corrupt already-created Evidence records; the snapshot they hold remains intact and inspectable,
+* `source_reference` may still point at a since-deleted Document/Dataset ID — the UI should resolve this and, if the source no longer exists, show the source as unavailable while still rendering the preserved snapshot content,
+* re-running or re-opening an old investigation must never trigger a live re-fetch of the original source through Evidence records.
+
+This directly resolves the retention gap noted in RAG_SYSTEM.md §41: deleting a source affects future retrieval and analysis, never historical evidence.
+
+---
+
+# 16. Document Evidence
+
+Example metadata:
+
+```json
+{
+  "document_id": "...",
+  "chunk_id": "...",
+  "page": 2,
+  "section": "Shipping Provider Migration"
+}
+```
+
+---
+
+# 17. Query Evidence
+
+Example metadata:
+
+```json
+{
+  "dataset_ids": ["..."],
+  "sql": "SELECT ...",
+  "columns": ["period", "refund_rate"],
+  "row_count": 2
+}
+```
+
+Avoid storing excessively large result sets as evidence.
+
+Store the minimum necessary supporting result.
+
+---
+
+# 18. Metric Evidence
+
+Example:
+
+```json
+{
+  "metric": "refund_rate_change",
+  "before": 0.041,
+  "after": 0.052,
+  "change_percent": 26.8
+}
+```
+
+Calculated values should originate from deterministic computation.
+
+---
+
+# 19. Finding
+
+A separate Finding entity may be useful later.
+
+Potential representation:
+
+```text
+Finding
+- statement
+- importance
+- evidence references
+- confidence
+```
+
+For V1 this may initially be represented inside investigation output.
+
+Do not create the table until implementation shows a clear need.
+
+---
+
+# 20. LLM Execution
+
+AI calls should eventually be traceable independently from tool calls.
+
+Potential entity:
+
+```text
+LLMExecution
+```
+
+## Fields
+
+```text
+id
+investigation_id
+investigation_step_id
+
+provider
+model
+operation_type
+
+input_tokens
+output_tokens
+
+estimated_cost
+
+duration_ms
+
+status
+error_message
+
+created_at
+```
+
+Prompt contents should not automatically be persisted in full.
+
+Sensitive business data must be considered.
+
+---
+
+# 21. Retrieval Trace
+
+Retrieval debugging may require information such as:
+
+```text
+query
+candidate chunks
+retrieval method
+vector score
+keyword score
+fusion score
+reranker score
+selected/not selected
+```
+
+This may be represented through structured observability metadata rather than a dedicated table initially.
+
+Avoid over-modeling before retrieval implementation exists.
+
+---
+
+# 22. Investigation Result Structure
+
+The final result should conceptually contain:
+
+```json
+{
+  "summary": "...",
+  "findings": [],
+  "recommendations": [],
+  "evidence": [],
+  "charts": [],
+  "confidence": {}
+}
+```
+
+Exact schemas should be defined during Agent System implementation.
+
+---
+
+# 23. Chart Representation
+
+Charts should be based on structured analytical outputs rather than image generation.
+
+Potential schema:
+
+```json
+{
+  "type": "line",
+  "title": "Refund Rate Over Time",
+  "x": [...],
+  "series": [
+    {
+      "name": "Refund Rate",
+      "values": [...]
+    }
+  ]
+}
+```
+
+Do not persist generated chart images unless later required.
+
+---
+
+# 24. Soft Delete
+
+V1 may use deletion timestamps for important user-owned data.
+
+Potential field:
+
+```text
+deleted_at
+```
+
+Exact delete semantics should be decided per entity.
+
+Uploaded business data should not remain queryable after deletion.
+
+---
+
+# 25. Time Handling
+
+Store application timestamps in UTC.
+
+Frontend should handle local presentation.
+
+Northstar synthetic business timestamps (order_date, shipped_at, delivered_at, refund_requested_at, ticket created_at, etc.) are generated as timezone-aware UTC values. No timezone conversion occurs anywhere in the generation or ingestion pipeline. This is a fixed decision (see DATASET.md §3) specifically because day-boundary calculations (`is_delayed = delivery_days > 4`, before/after July 11 comparisons) are the basis of the primary demo conclusion and must not be exposed to timezone-related off-by-one-day errors.
+
+Any future real (non-synthetic) uploaded business data with genuinely local timestamps will require its own explicit timezone-handling decision at that time; this is not needed for V1/Northstar.
+
+---
+
+# 26. IDs
+
+Prefer UUIDs for application-domain records.
+
+Reasons:
+
+* avoids exposing sequential identifiers,
+* works well with distributed workflows later,
+* predictable API representation.
+
+Analytical dataset rows may preserve original business IDs.
+
+---
+
+# 27. JSON Fields
+
+Use JSON/JSONB for:
+
+* flexible metadata,
+* bounded structured outputs,
+* provider-specific trace details.
+
+Do not use JSON as a replacement for relational modeling when fields are central to querying or integrity.
+
+---
+
+# 28. Indexing Strategy
+
+Expected indexes include:
+
+* workspace foreign keys,
+* investigation status,
+* investigation creation time,
+* document foreign keys,
+* dataset foreign keys,
+* pgvector index,
+* frequently filtered metadata where justified.
+
+Do not add indexes speculatively.
+
+Measure query patterns as the implementation matures.
+
+---
+
+# 29. Data Integrity Principles
+
+Use database constraints where appropriate.
+
+Examples:
+
+* required workspace references,
+* unique workspace slug,
+* valid status values,
+* correct foreign-key relationships.
+
+Do not rely entirely on application validation for relational integrity.
+
+---
+
+# 30. V1 Data Model Principle
+
+The data model should support the current investigation workflow without attempting to model every future enterprise feature.
+
+Do not add entities for:
+
+* billing,
+* teams,
+* organization hierarchy,
+* complex permissions,
+* connectors,
+* workflow automation
+
+until product scope requires them.
