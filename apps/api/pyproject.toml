@@ -24,6 +24,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
     "aiosqlite>=0.20",
+    # Used only by scripts/northstar (Phase 2 dataset generator) to render the
+    # demo business documents as PDF (DATASET.md §19). Not an API runtime
+    # dependency: the Dockerfile's `pip install .` never pulls dev extras, so
+    # this never ships in the deployed API image (ADR-023).
+    "fpdf2>=2.7",
 ]
 
 [build-system]

@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack
+.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack generate-northstar
 
 TEST_PG_CONTAINER := opspilot-test-pg
 TEST_REDIS_CONTAINER := opspilot-test-redis
@@ -43,3 +43,9 @@ lint-web:
 # Requires `make up` (or `docker compose up`) to already be running.
 verify-stack:
 	./scripts/verify_stack.sh
+
+# Regenerates the deterministic Northstar Commerce demo dataset (BACKLOG.md
+# Phase 2) into data/northstar/. Aborts without writing output if the
+# generated data fails DATASET.md's validation checks (§30).
+generate-northstar:
+	cd apps/api && . .venv/bin/activate && cd ../.. && PYTHONPATH=scripts python -m northstar.generate

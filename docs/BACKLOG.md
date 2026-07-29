@@ -154,95 +154,108 @@ Rules:
 
 ## 2.1 Dataset Generator Architecture
 
-* [ ] Create deterministic generation package/script
-* [ ] Define fixed random seed
-* [ ] Define generator configuration
-* [ ] Add output directory structure
+* [x] Create deterministic generation package/script — `scripts/northstar/` (ADR-023)
+* [x] Define fixed random seed — `GeneratorConfig.seed` (`random.Random(seed)`, no global random state)
+* [x] Define generator configuration — `northstar/config.py::GeneratorConfig`
+* [x] Add output directory structure — `data/northstar/{csv,documents,eval,private}/` (gitignored, regenerated via `make generate-northstar`, ADR-023)
 
 ---
 
 ## 2.2 Customers
 
-* [ ] Generate customer IDs
-* [ ] Generate customer segments
-* [ ] Generate acquisition channels
-* [ ] Generate geographic attributes
-* [ ] Generate derived lifetime metrics where appropriate
+* [x] Generate customer IDs
+* [x] Generate customer segments
+* [x] Generate acquisition channels
+* [x] Generate geographic attributes
+* [x] Generate derived lifetime metrics where appropriate — `lifetime_orders`/`lifetime_value` computed from actual generated orders, not independently randomized
 
 ---
 
 ## 2.3 Products
 
-* [ ] Generate product catalog
-* [ ] Generate categories
-* [ ] Generate pricing
-* [ ] Generate costs
-* [ ] Validate product IDs
+* [x] Generate product catalog
+* [x] Generate categories
+* [x] Generate pricing
+* [x] Generate costs
+* [x] Validate product IDs
 
 ---
 
 ## 2.4 Orders
 
-* [ ] Generate June–July order timeline
-* [ ] Generate customer/product relationships
-* [ ] Model SwiftShip baseline
-* [ ] Introduce July 11 RapidShip migration
-* [ ] Generate delivery-time distributions
-* [ ] Generate delays
-* [ ] Generate order values
-* [ ] Generate statuses
+* [x] Generate June–July order timeline
+* [x] Generate customer/product relationships
+* [x] Model SwiftShip baseline (mean ~2.8 days)
+* [x] Introduce July 11 RapidShip migration (traffic share + delivery-time shift)
+* [x] Generate delivery-time distributions
+* [x] Generate delays
+* [x] Generate order values
+* [x] Generate statuses
 
 ---
 
 ## 2.5 Refunds
 
-* [ ] Generate baseline refund behavior
-* [ ] Increase late-delivery refund probability after incident
-* [ ] Preserve unrelated refund reasons
-* [ ] Generate refund amounts
-* [ ] Maintain order/customer relationships
+* [x] Generate baseline refund behavior
+* [x] Increase late-delivery refund probability after incident
+* [x] Preserve unrelated refund reasons
+* [x] Generate refund amounts
+* [x] Maintain order/customer relationships
 
 ---
 
 ## 2.6 Support Tickets
 
-* [ ] Generate baseline ticket volume
-* [ ] Generate ticket categories
-* [ ] Generate realistic ticket text variation
-* [ ] Increase shipping complaints after incident
-* [ ] Generate sentiment
-* [ ] Generate resolution time
+* [x] Generate baseline ticket volume
+* [x] Generate ticket categories
+* [x] Generate realistic ticket text variation
+* [x] Increase shipping complaints after incident
+* [x] Generate sentiment
+* [x] Generate resolution time
 
 ---
 
 ## 2.7 Business Documents
 
-* [ ] Create Refund Policy
-* [ ] Create Shipping Policy
-* [ ] Create Customer Support Handbook
-* [ ] Create Shipping Provider Migration Report
-* [ ] Create July Operations Incident Report
+* [x] Create Refund Policy
+* [x] Create Shipping Policy
+* [x] Create Customer Support Handbook
+* [x] Create Shipping Provider Migration Report
+* [x] Create July Operations Incident Report
 
 ---
 
 ## 2.8 Ground Truth
 
-* [ ] Generate private ground_truth.json
-* [ ] Record incident date
-* [ ] Record expected patterns
-* [ ] Ensure runtime application never reads this as evidence
+* [x] Generate private ground_truth.json
+* [x] Record incident date
+* [x] Record expected patterns
+* [x] Ensure runtime application never reads this as evidence — lives under `data/northstar/private/`, gitignored, not imported by any `apps/api` code
 
 ---
 
 ## 2.9 Validation
 
-* [ ] Validate dataset relationships
-* [ ] Validate provider migration timing
-* [ ] Validate delivery-time increase
-* [ ] Validate ticket increase
-* [ ] Validate refund increase
-* [ ] Validate realistic noise
-* [ ] Produce validation summary
+* [x] Validate dataset relationships
+* [x] Validate provider migration timing
+* [x] Validate delivery-time increase
+* [x] Validate ticket increase
+* [x] Validate refund increase
+* [x] Validate realistic noise
+* [x] Produce validation summary — `data/northstar/private/validation_report.json` + stdout; `generate.py` refuses to write output if any check fails
+
+---
+
+## Phase 2 Definition of Done
+
+* [x] all files can be generated reproducibly — verified: two runs with the default seed produce byte-identical CSV/ground-truth output
+* [x] relationships are valid — enforced by `northstar.validate` + `tests/unit/test_northstar_generator.py`
+* [x] the migration event is represented in documents
+* [x] the intended analytical signals exist
+* [x] signals contain realistic noise
+* [x] the primary conclusion can be independently verified (`ground_truth.json`, computed from actual data)
+* [x] at least five useful investigations are supported — canonical `evaluation_questions.json` (DATASET.md §33), 18 questions across retrieval/analytics/agent/e2e
+* [x] no application code needs hardcoded knowledge of the answer — `apps/api` does not reference `scripts/northstar` or `data/northstar` at all
 
 ---
 

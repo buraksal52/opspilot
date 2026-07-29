@@ -766,3 +766,38 @@ Backend tests always run against short-lived, dedicated Docker containers (`opsp
 * CI must run `make test-api` (or equivalent container setup) rather than assuming a pre-existing database.
 * This pattern should be followed for any future test suites needing PostgreSQL/Redis (e.g. Phase 3+ ingestion tests), rather than introducing a second, inconsistent mechanism.
 * This supersedes ARCHITECTURE.md §6's earlier "suggested... may evolve" framing; the structure above is now the reference layout for Phase 1 scaffolding.
+
+---
+
+# ADR-023 — Northstar Dataset Generator: Location, Dependencies, and Output Handling
+
+## Context
+
+BACKLOG.md Phase 2 required a deterministic generator for the Northstar Commerce demo dataset (DATASET.md): five CSVs, five business documents, `ground_truth.json`, and the canonical `evaluation_questions.json` question bank (DATASET.md §33). Three implementation questions were not yet settled: where the generator code lives relative to `apps/api` (ADR-021's approved layout only covers application code), whether it needs its own Python environment, and whether its output belongs in version control.
+
+## Decision
+
+* **Location:** the generator lives at `scripts/northstar/` as a plain Python package (stdlib-only for CSV/JSON generation — no Faker/pandas/numpy). This matches ADR-021, which already carves out `scripts/` as a non-application-code concern separate from `apps/api/app/`'s layered structure.
+* **Python environment:** the generator reuses `apps/api/.venv` rather than getting its own virtualenv. `pytest.ini`'s `pythonpath` was extended to `apps/api scripts` so `tests/unit/test_northstar_generator.py` can `import northstar.*` through the same environment `make test-api` already uses. A second venv was judged unjustified process overhead for a single-purpose script package.
+* **PDF dependency isolation:** DATASET.md §19 names the five business documents with a `.pdf` extension, and Phase 3's PDF parser needs real PDF fixtures to test against, so documents are rendered as PDF (via `fpdf2`, pure-Python, no transitive dependencies) in addition to their Markdown source. `fpdf2` is declared only under `apps/api/pyproject.toml`'s `[project.optional-dependencies] dev` extra, never as a core dependency — the Dockerfile's `pip install .` does not install extras, so it never reaches the deployed API image.
+* **Generated output is not committed to git.** `data/northstar/` (CSVs, documents, `ground_truth.json`, `evaluation_questions.json`, `validation_report.json`) is gitignored and reproduced on demand via `make generate-northstar`, which refuses to write output at all if `northstar.validate` reports any failing check (DATASET.md §30).
+* **Ground truth and evaluation-question values are computed, not hand-typed.** `northstar.metrics` is the single source of the "actual" numbers (refund rates, delivery-day averages, ticket shares) consumed by both `ground_truth.json` and the `analytics`-tagged questions in `evaluation_questions.json`, so the two files can never silently drift apart from what the generator actually produced.
+
+## Rationale
+
+* Reuses existing, working tooling (`apps/api/.venv`, `pytest.ini`, `make test-api`) instead of introducing a second Python environment and a second test-runner entry point for one script package (CLAUDE.md §15, avoid unnecessary abstractions).
+* Keeps the deployed API's dependency surface unchanged — a PDF-rendering library has no business being importable at API runtime (SECURITY.md §35, dependency additions must be justified).
+* A deterministic, seeded generator makes committing its output redundant: anyone can reproduce byte-identical CSVs via `make generate-northstar` (verified: two runs with the default seed produce identical CSV/ground-truth output), and gitignoring it keeps the repository free of large generated artifacts.
+* Deriving `ground_truth.json` and the analytics evaluation questions from the same `northstar.metrics` computation (rather than both copying DATASET.md's target *ranges* by hand) means evaluation always checks against what the dataset actually contains, not an aspirational target that generation might miss.
+
+## Alternatives
+
+* **A dedicated `scripts/pyproject.toml` and separate venv:** rejected — adds a second dependency-management surface and Makefile activation path for no benefit at V1 scale.
+* **Committing `data/northstar/` to the repository:** considered, for interview/portfolio reproducibility without a generation step. Rejected in favor of `make generate-northstar` being fast (~1 second) and fully deterministic, which makes "regenerate on demand" equivalent to "already there" without repository bloat. May be revisited in Phase 12 (Polish & Portfolio) if a zero-setup clone-and-run demo is judged more valuable than a lean repository.
+* **Hardcoding DATASET.md's target ranges directly into `ground_truth.json`:** rejected — would silently pass even if the generator's actual output drifted from those targets; computing from real generated data makes ground truth self-consistent with the dataset it describes.
+
+## Consequences
+
+* `make generate-northstar` must run (implicitly or explicitly) before any Phase 3+ work that consumes `data/northstar/` (ingestion tests, RAG/analytics/agent evaluation) — it is not a one-time setup step to forget about.
+* Any future script requiring dependencies not already in `apps/api/.venv` should default to the same `dev`-extras-isolation pattern established here, rather than inventing a new per-script environment.
+* `northstar.metrics` is now a de facto contract: Phase 3+ code that needs "the same numbers the demo dataset was validated against" should call into it rather than recomputing equivalent logic independently.

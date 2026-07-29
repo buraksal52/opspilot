@@ -28,6 +28,9 @@ npm-debug.log*
 # Docker
 *.pid
 
+# Generated Northstar demo dataset (deterministic; regenerate with `make generate-northstar`)
+data/
+
 # OS
 .DS_Store
 
