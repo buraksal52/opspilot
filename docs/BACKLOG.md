@@ -49,104 +49,104 @@ Rules:
 
 ## 1.1 Repository
 
-* [ ] Create frontend application under `apps/web/`
-* [ ] Create backend application under `apps/api/app/` with `api/`, `core/`, `domain/`, `application/`, `infrastructure/` (ADR-021) — create each subpackage when it has its first real file, not all five empty upfront
-* [ ] Establish root project structure per ADR-021 (`apps/`, `scripts/`, `infra/`, `tests/`, `docs/`)
-* [ ] Add .gitignore
-* [ ] Add .env.example (include JWT signing secret and database URL placeholders)
-* [ ] Add basic developer scripts/commands
+* [x] Create frontend application under `apps/web/`
+* [x] Create backend application under `apps/api/app/` with `api/`, `core/`, `domain/`, `application/`, `infrastructure/` (ADR-021) — create each subpackage when it has its first real file, not all five empty upfront
+* [x] Establish root project structure per ADR-021 (`apps/`, `scripts/`, `infra/`, `tests/`, `docs/`)
+* [x] Add .gitignore
+* [x] Add .env.example (include JWT signing secret and database URL placeholders)
+* [x] Add basic developer scripts/commands
 
 ---
 
 ## 1.2 Backend Foundation
 
-* [ ] Initialize FastAPI
-* [ ] Add application settings/configuration
-* [ ] Configure environment loading
-* [ ] Add health endpoint
-* [ ] Add structured application logging
-* [ ] Add common error-response structure
-* [ ] Add initial dependency layout
+* [x] Initialize FastAPI
+* [x] Add application settings/configuration
+* [x] Configure environment loading
+* [x] Add health endpoint
+* [x] Add structured application logging
+* [x] Add common error-response structure
+* [x] Add initial dependency layout
 
 ---
 
 ## 1.3 PostgreSQL
 
-* [ ] Add PostgreSQL service
-* [ ] Configure application database connection (SQLAlchemy 2.x async engine, ADR-020)
-* [ ] Configure Alembic migrations
-* [ ] Create `app` schema strategy
-* [ ] Create `analytics` schema strategy (no Alembic-managed tables here — per-Dataset tables are created programmatically per ADR-017/020)
-* [ ] Verify migrations from clean database
+* [x] Add PostgreSQL service
+* [x] Configure application database connection (SQLAlchemy 2.x async engine, ADR-020)
+* [x] Configure Alembic migrations
+* [x] Create `app` schema strategy
+* [x] Create `analytics` schema strategy (no Alembic-managed tables here — per-Dataset tables are created programmatically per ADR-017/020)
+* [x] Verify migrations from clean database
 
 ---
 
 ## 1.4 Foundational Models & Authentication
 
-* [ ] Implement User model (including `hashed_password`, ADR-019)
-* [ ] Implement Workspace model (`owner_id` as the V1 authorization anchor, ADR-019)
-* [ ] Add database constraints
-* [ ] Add migrations
-* [ ] Add repository/service boundaries where justified
-* [ ] Implement password hashing/verification using pwdlib (Argon2)
-* [ ] Implement JWT issuance/verification using PyJWT
-* [ ] Implement login endpoint (`POST /api/v1/auth/login`)
-* [ ] Implement auth dependency that resolves the current user from the `Authorization: Bearer` header for protected routes
-* [ ] Implement workspace-ownership authorization check (`Workspace.owner_id`) as a reusable dependency
-* [ ] Add tests: login success/failure, invalid/expired token rejection, cross-workspace access denial
+* [x] Implement User model (including `hashed_password`, ADR-019)
+* [x] Implement Workspace model (`owner_id` as the V1 authorization anchor, ADR-019)
+* [x] Add database constraints
+* [x] Add migrations
+* [x] Add repository/service boundaries where justified
+* [x] Implement password hashing/verification using pwdlib (Argon2)
+* [x] Implement JWT issuance/verification using PyJWT
+* [x] Implement login endpoint (`POST /api/v1/auth/login`)
+* [x] Implement auth dependency that resolves the current user from the `Authorization: Bearer` header for protected routes
+* [x] Implement workspace-ownership authorization check (`Workspace.owner_id`) as a reusable dependency
+* [x] Add tests: login success/failure, invalid/expired token rejection, cross-workspace access denial
 
 ---
 
 ## 1.5 Redis
 
-* [ ] Add Redis service to local environment
-* [ ] Add application Redis configuration
-* [ ] Add health/connectivity verification
-* [ ] Do not implement caching/jobs yet without need
+* [x] Add Redis service to local environment
+* [x] Add application Redis configuration
+* [x] Add health/connectivity verification
+* [x] Do not implement caching/jobs yet without need
 
 ---
 
 ## 1.6 Frontend Foundation
 
-* [ ] Initialize Next.js + TypeScript
-* [ ] Configure Tailwind
-* [ ] Configure shadcn/ui
-* [ ] Create application shell
-* [ ] Create navigation
-* [ ] Create base dashboard route
-* [ ] Connect frontend to backend health endpoint
+* [x] Initialize Next.js + TypeScript
+* [x] Configure Tailwind
+* [x] Configure shadcn/ui
+* [x] Create application shell
+* [x] Create navigation
+* [x] Create base dashboard route
+* [x] Connect frontend to backend health endpoint
 
 ---
 
 ## 1.7 Docker
 
-* [ ] Create backend Dockerfile
-* [ ] Create frontend Dockerfile
-* [ ] Create Docker Compose setup
-* [ ] Include PostgreSQL
-* [ ] Include Redis
-* [ ] Verify clean local startup
+* [x] Create backend Dockerfile
+* [x] Create frontend Dockerfile
+* [x] Create Docker Compose setup
+* [x] Include PostgreSQL
+* [x] Include Redis
+* [x] Verify clean local startup
 
 ---
 
 ## 1.8 Phase 1 Tests
 
-* [ ] Backend health test
-* [ ] Database integration test
-* [ ] Workspace persistence test
-* [ ] Basic frontend/API connectivity verification
+* [x] Backend health test
+* [x] Database integration test
+* [x] Workspace persistence test
+* [x] Basic frontend/API connectivity verification
 
 ---
 
 ## Phase 1 Definition of Done
 
-* [ ] `docker compose up` starts required services
-* [ ] API health endpoint works
-* [ ] frontend reaches backend
-* [ ] PostgreSQL migrations work
-* [ ] Workspace persists
-* [ ] tests pass
-* [ ] relevant docs updated
+* [x] `docker compose up` starts required services
+* [x] API health endpoint works
+* [x] frontend reaches backend
+* [x] PostgreSQL migrations work
+* [x] Workspace persists
+* [x] tests pass
+* [x] relevant docs updated
 
 ---
 

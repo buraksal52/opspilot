@@ -731,4 +731,38 @@ Backend application code lives under `apps/api/app/`, organized by **logical lay
 
 * Do not create empty placeholder subpackages for a business module before it has real code — create `application/investigations/`, `infrastructure/retrieval/`, etc. when their first real file is added, not upfront (CLAUDE.md §15, avoiding speculative abstraction).
 * `tests/` mirrors the structure already specified in TESTING.md §3 and is unaffected by this ADR.
+
+---
+
+# ADR-022 — Disposable Docker Containers for Backend Test Infrastructure
+
+## Context
+
+Phase 1 introduced the first database- and Redis-backed automated tests (`tests/api`, `tests/integration`). TESTING.md §29 says to prefer small deterministic fixtures and does not mandate a specific mechanism for providing PostgreSQL/Redis to those tests. A concrete choice was needed: run tests against the same `docker compose` stack developers use locally, use an in-process substitute (e.g. SQLite for Postgres), or use dedicated, disposable containers.
+
+## Decision
+
+Backend tests always run against short-lived, dedicated Docker containers (`opspilot-test-pg`, `opspilot-test-redis`), started and torn down by `make test-api` (`Makefile` `test-infra-up`/`test-infra-down` targets), never against the `docker compose` dev stack (`docker-compose.yml`'s `postgres`/`redis` services).
+
+* `tests/conftest.py` points at these containers via `TEST_DATABASE_URL`/`REDIS_URL` (defaulting to ports `55432`/`63790`, distinct from the dev stack's `5432`/`6379`, so both can run concurrently without conflict).
+* The session-scoped fixture runs the real Alembic migration chain (`alembic upgrade head` / `downgrade base`) against the test container — not `Base.metadata.create_all()` — so migrations themselves are exercised as part of every test run, not just implicitly trusted.
+* Real PostgreSQL (not SQLite) is used so Postgres-specific behavior (schemas, `gen_random_uuid`/`Uuid` type mapping, constraint semantics) matches production.
+
+## Rationale
+
+* Running tests against the dev `docker compose` stack was rejected because the fixture teardown runs `alembic downgrade base`, which drops the `app`/`analytics` schemas — acceptable for a disposable container, destructive if pointed at a developer's persistent local data.
+* SQLite would not exercise the actual PostgreSQL dialect (schemas, constraint behavior) the application depends on, undermining confidence that passing tests reflect real Postgres behavior.
+* A dedicated testcontainers-style library was considered unnecessary added dependency weight for V1 — two `docker run` commands in the `Makefile` achieve the same isolation with no new Python dependency.
+
+## Alternatives
+
+* **Reuse the `docker compose` dev stack for tests:** rejected — destructive teardown risk against real local dev data.
+* **SQLite in-memory database for tests:** rejected — does not validate actual PostgreSQL schema/constraint behavior.
+* **`testcontainers` Python library:** deferred — plain `docker run`/`docker rm` in the `Makefile` is sufficient for V1 and avoids an additional dependency; may be revisited if test infra needs grow (e.g. parallel test workers needing per-worker containers).
+
+## Consequences
+
+* `make test-api` is the standard way to run backend tests locally; running `pytest tests/` directly requires the developer to have already started matching Postgres/Redis instances on the expected ports (or overridden `TEST_DATABASE_URL`/`REDIS_URL`).
+* CI must run `make test-api` (or equivalent container setup) rather than assuming a pre-existing database.
+* This pattern should be followed for any future test suites needing PostgreSQL/Redis (e.g. Phase 3+ ingestion tests), rather than introducing a second, inconsistent mechanism.
 * This supersedes ARCHITECTURE.md §6's earlier "suggested... may evolve" framing; the structure above is now the reference layout for Phase 1 scaffolding.

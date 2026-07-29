@@ -519,6 +519,14 @@ Do not make every test depend on the full synthetic dataset.
 
 ---
 
+# 29a. Backend Test Infrastructure (Postgres/Redis)
+
+Per ADR-022, `tests/api` and `tests/integration` never run against the `docker compose` development stack. `make test-api` starts short-lived, dedicated containers (`opspilot-test-pg` on port `55432`, `opspilot-test-redis` on port `63790`), runs the real Alembic migration chain against them, runs the suite, then tears the containers down — regardless of test outcome.
+
+This matters because the test session fixture runs `alembic downgrade base` at teardown, which drops the `app`/`analytics` schemas; pointed at a developer's persistent dev database, that would destroy local data. Running `pytest tests/` directly requires a matching Postgres/Redis already reachable at those ports (or `TEST_DATABASE_URL`/`REDIS_URL` overridden) — `make test-api` is the supported entry point.
+
+---
+
 # 30. External AI API Tests
 
 Normal CI should not depend heavily on live paid LLM APIs.
