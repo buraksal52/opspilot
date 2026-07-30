@@ -12,5 +12,15 @@ async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    # Commits the request's transaction on clean exit, rolls back on any
+    # exception (including domain errors raised after partial writes), so a
+    # route handler never needs to call commit()/rollback() itself. Phase 1's
+    # endpoints were all read-only so this had no observable effect yet;
+    # Phase 3 introduces the first writes (BACKLOG.md 3.2).
     async with async_session_factory() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

@@ -1,6 +1,10 @@
 import Link from "next/link";
 
-const NAV_LINKS = [{ href: "/dashboard", label: "Dashboard" }];
+const NAV_LINKS = [
+  { href: "/dashboard", label: "Dashboard" },
+  { href: "/data-sources", label: "Data Sources" },
+  { href: "/login", label: "Login" },
+];
 
 export function Nav() {
   return (

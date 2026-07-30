@@ -23,6 +23,10 @@ class Settings(BaseSettings):
 
     cors_allowed_origins: str = "http://localhost:3000"
 
+    # --- Uploads / ingestion (Phase 3, SECURITY.md §19-22) ---
+    upload_base_dir: str = "var/uploads"
+    upload_max_size_bytes: int = 25 * 1024 * 1024  # 25 MB
+
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]

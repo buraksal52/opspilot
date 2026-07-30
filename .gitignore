@@ -31,6 +31,9 @@ npm-debug.log*
 # Generated Northstar demo dataset (deterministic; regenerate with `make generate-northstar`)
 data/
 
+# Uploaded raw files (local dev storage, apps/api/app/infrastructure/storage)
+var/
+
 # OS
 .DS_Store
 

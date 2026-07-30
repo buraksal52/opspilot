@@ -801,3 +801,35 @@ BACKLOG.md Phase 2 required a deterministic generator for the Northstar Commerce
 * `make generate-northstar` must run (implicitly or explicitly) before any Phase 3+ work that consumes `data/northstar/` (ingestion tests, RAG/analytics/agent evaluation) — it is not a one-time setup step to forget about.
 * Any future script requiring dependencies not already in `apps/api/.venv` should default to the same `dev`-extras-isolation pattern established here, rather than inventing a new per-script environment.
 * `northstar.metrics` is now a de facto contract: Phase 3+ code that needs "the same numbers the demo dataset was validated against" should call into it rather than recomputing equivalent logic independently.
+
+---
+
+# ADR-024 — Background Worker Technology: arq Selected, Activation Deferred to Phase 4
+
+## Context
+
+ADR-018 deferred selecting a background worker technology to "the beginning of Phase 3," and BACKLOG.md's Phase 3.0 gate requires that selection be made and recorded before Phase 3 (Data Ingestion) proceeds. The candidate workloads are PDF parsing and CSV ingestion (Phase 3) and embedding generation (Phase 4).
+
+## Decision
+
+* **Technology selected:** [arq](https://github.com/samuelcolvin/arq) — an async, Redis-backed job queue.
+* **Activation deferred to Phase 4.** Phase 3 does not stand up arq or any worker process. Document and dataset ingestion (PDF/Markdown/text parsing, CSV parsing + physical table creation) run **synchronously inside the upload request**. The upload endpoint still returns a `DataSource` immediately in `UPLOADED` status and transitions it through `PROCESSING` before returning (API.md §6's "processing may continue asynchronously" is a permitted response shape, not a requirement — V1 chooses the simpler synchronous path since it is also correct at this scale).
+
+## Rationale
+
+* Northstar-scale inputs are small: five business documents (each well under a second to parse with `pypdf`) and CSVs up to ~15,000 rows (well under a second to parse and bulk-insert). There is no request-latency problem to solve yet.
+* CLAUDE.md §14 / ROADMAP.md §2: "do not introduce asynchronous infrastructure before it is needed." Standing up Redis-backed job dispatch, a worker process, Docker Compose changes, and job-status polling for a sub-second operation would be complexity without a corresponding benefit.
+* arq is selected now (rather than re-opening the evaluation in Phase 4) because the workload that actually needs it — embedding generation, potentially over large document sets, genuinely slow relative to a request lifecycle — is already known from RAG_SYSTEM.md §4/§12. arq fits the project's existing choices: async-native (consistent with ADR-020's async SQLAlchemy engine on request paths), Redis-backed (Redis is already a dependency per ADR-005), and it is significantly lighter to operate than Celery (no separate broker beyond the Redis instance already running, no additional exchange/queue configuration).
+
+## Alternatives
+
+* **Celery:** rejected — heavier operationally (typically wants a dedicated broker configuration and its own monitoring), and its worker model is synchronous-first, which fights against this codebase's async-first request path (ADR-020).
+* **RQ (Redis Queue):** a reasonable lighter-weight alternative to Celery, but synchronous rather than async; arq is effectively "RQ's ideas, async" and fits better alongside FastAPI's async handlers.
+* **FastAPI `BackgroundTasks`:** rejected as the long-term answer — it runs in-process with no persistence, retry, or cross-process visibility, which ARCHITECTURE.md §4 (Background Worker) and SECURITY.md §32 (bounded retries, resource exhaustion controls) both expect a real job system to provide. Acceptable only as what Phase 3 already does today: no queue at all, plain synchronous execution.
+* **Selecting nothing yet, re-evaluating in Phase 4:** rejected — the evaluation itself is cheap and the workloads that justify a choice (RAG_SYSTEM.md's embedding pipeline) are already specified in enough detail to decide now; deferring again would just repeat ADR-018's deferral without new information arriving in the meantime.
+
+## Consequences
+
+* Phase 3 ingestion code (`application/ingestion/*`) must be written so moving it behind an arq task in Phase 4 is a wiring change, not a rewrite: ingestion logic lives in plain application-service methods that an API route calls directly today and an arq worker function can call identically later.
+* Phase 4 (Retrieval/RAG) is the phase that must actually add arq to `docker-compose.yml`, define its worker entrypoint, and wire embedding generation through it. Phase 4 cannot be marked done on synchronous embedding generation alone if document volume makes that impractical.
+* This supersedes ADR-018 in full; ADR-018 stays in this document for history but is no longer the operative decision.

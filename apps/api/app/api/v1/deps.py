@@ -5,15 +5,22 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.auth.service import AuthService
+from app.application.ingestion.dataset_ingestion_service import DatasetIngestionService
+from app.application.ingestion.document_ingestion_service import DocumentIngestionService
+from app.application.ingestion.upload_service import UploadService
 from app.core.config import Settings, get_settings
 from app.core.errors import NotFoundError, UnauthorizedError
+from app.domain.data_source import DataSource
 from app.domain.user import User
 from app.domain.workspace import Workspace
 from app.infrastructure.auth.jwt_provider import JWTProvider, TokenError
 from app.infrastructure.auth.password_hasher import PasswordHasher
+from app.infrastructure.database.repositories.data_source_repository import DataSourceRepository
+from app.infrastructure.database.repositories.document_repository import DocumentRepository
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.repositories.workspace_repository import WorkspaceRepository
 from app.infrastructure.database.session import get_db
+from app.infrastructure.storage.file_storage import FileStorage, LocalFileStorage
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -79,3 +86,59 @@ async def require_workspace_access(
         raise NotFoundError("The requested workspace does not exist.")
 
     return workspace
+
+
+def get_file_storage(settings: Settings = Depends(get_settings)) -> FileStorage:
+    return LocalFileStorage(settings.upload_base_dir)
+
+
+def get_data_source_repository(session: AsyncSession = Depends(get_db)) -> DataSourceRepository:
+    return DataSourceRepository(session)
+
+
+def get_document_repository(session: AsyncSession = Depends(get_db)) -> DocumentRepository:
+    return DocumentRepository(session)
+
+
+def get_document_ingestion_service(
+    document_repository: DocumentRepository = Depends(get_document_repository),
+) -> DocumentIngestionService:
+    return DocumentIngestionService(document_repository)
+
+
+def get_dataset_ingestion_service(session: AsyncSession = Depends(get_db)) -> DatasetIngestionService:
+    return DatasetIngestionService(session)
+
+
+def get_upload_service(
+    data_source_repository: DataSourceRepository = Depends(get_data_source_repository),
+    file_storage: FileStorage = Depends(get_file_storage),
+    document_ingestion_service: DocumentIngestionService = Depends(get_document_ingestion_service),
+    dataset_ingestion_service: DatasetIngestionService = Depends(get_dataset_ingestion_service),
+    settings: Settings = Depends(get_settings),
+) -> UploadService:
+    return UploadService(
+        data_source_repository,
+        file_storage,
+        document_ingestion_service,
+        dataset_ingestion_service,
+        settings.upload_max_size_bytes,
+    )
+
+
+async def require_data_source_access(
+    data_source_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    data_source_repository: DataSourceRepository = Depends(get_data_source_repository),
+    workspace_repository: WorkspaceRepository = Depends(get_workspace_repository),
+) -> DataSource:
+    data_source = await data_source_repository.get_by_id(data_source_id)
+    if data_source is None:
+        raise NotFoundError("The requested data source does not exist.")
+
+    workspace = await workspace_repository.get_by_id(data_source.workspace_id)
+    if workspace is None or workspace.owner_id != current_user.id:
+        # Same fail-closed, identical-404 pattern as require_workspace_access.
+        raise NotFoundError("The requested data source does not exist.")
+
+    return data_source
