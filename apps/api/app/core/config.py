@@ -27,6 +27,26 @@ class Settings(BaseSettings):
     upload_base_dir: str = "var/uploads"
     upload_max_size_bytes: int = 25 * 1024 * 1024  # 25 MB
 
+    # --- Embeddings / RAG (Phase 4, ADR-025) ---
+    gemini_api_key: str = "changeme-your-gemini-api-key"
+    embedding_model: str = "gemini-embedding-001"
+    embedding_dimension: int = 768
+
+    # --- Chunking (RAG_SYSTEM.md §9) ---
+    chunk_target_tokens: int = 550
+    chunk_overlap_tokens: int = 75
+
+    # --- Retrieval (RAG_SYSTEM.md §19) ---
+    retrieval_candidate_limit: int = 15
+
+    # --- Reranking (RAG_SYSTEM.md §22, ADR-030) ---
+    reranker_model: str = "gemini-flash-latest"
+
+    # --- Context selection (RAG_SYSTEM.md §25) ---
+    # Deliberately bounded well below typical model context windows — "do not
+    # fill the context window merely because capacity exists."
+    context_token_budget: int = 4000
+
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]

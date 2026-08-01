@@ -61,6 +61,31 @@ async def test_upload_pdf_creates_ready_document(client, seeded_user, seeded_wor
     assert body["status"] == "READY"
 
 
+async def test_upload_pdf_creates_document_chunks(client, db_session, seeded_user, seeded_workspace):
+    """Chunking (BACKLOG 4.2) runs synchronously as part of ingestion
+    (ADR-026) — a successful upload must leave DocumentChunk rows behind,
+    all still unembedded until the arq job (Increment 4) runs."""
+    from app.infrastructure.database.repositories.document_chunk_repository import DocumentChunkRepository
+    from app.infrastructure.database.repositories.document_repository import DocumentRepository
+
+    user, _ = seeded_user
+    response = await client.post(
+        f"/api/v1/workspaces/{seeded_workspace.id}/data-sources/upload",
+        headers=_auth_headers(user.id),
+        files={"file": ("Shipping Policy.pdf", _minimal_pdf_bytes(), "application/pdf")},
+    )
+    assert response.status_code == 200
+    data_source_id = uuid.UUID(response.json()["id"])
+
+    document = await DocumentRepository(db_session).get_by_data_source_id(data_source_id)
+    assert document is not None
+
+    chunks = await DocumentChunkRepository(db_session).list_by_document(document.id)
+    assert len(chunks) >= 1
+    assert all(chunk.embedding is None for chunk in chunks)
+    assert "delivery window" in chunks[0].content.lower()
+
+
 async def test_upload_markdown_creates_ready_document(client, seeded_user, seeded_workspace):
     user, _ = seeded_user
     response = await client.post(

@@ -833,3 +833,239 @@ ADR-018 deferred selecting a background worker technology to "the beginning of P
 * Phase 3 ingestion code (`application/ingestion/*`) must be written so moving it behind an arq task in Phase 4 is a wiring change, not a rewrite: ingestion logic lives in plain application-service methods that an API route calls directly today and an arq worker function can call identically later.
 * Phase 4 (Retrieval/RAG) is the phase that must actually add arq to `docker-compose.yml`, define its worker entrypoint, and wire embedding generation through it. Phase 4 cannot be marked done on synchronous embedding generation alone if document volume makes that impractical.
 * This supersedes ADR-018 in full; ADR-018 stays in this document for history but is no longer the operative decision.
+
+---
+
+# ADR-025 — Embedding Provider: Google Gemini (`gemini-embedding-001`)
+
+## Context
+
+RAG_SYSTEM.md §12 requires a narrow `EmbeddingProvider` abstraction (`embed_text`/`embed_batch`) so application logic does not depend on one vendor (ADR-015). No LLM or embedding provider had been selected anywhere in the project before Phase 4 — `core/config.py` and `.env.example` had no provider API key placeholder. Phase 4 (chunk embedding, query embedding) is the first place a concrete choice is required.
+
+## Decision
+
+Use **Google Gemini** as the V1 embedding provider:
+
+* **Model:** `gemini-embedding-001`.
+* **Output dimension:** `768`, requested via the model's `output_dimensionality` parameter (Matryoshka Representation Learning truncation). Stored as `EMBEDDING_DIMENSION` in settings so the pgvector column width and this choice cannot silently drift apart.
+* **Task type:** the same `EmbeddingProvider.embed_batch(texts, task_type)` interface is used for both directions — `task_type="RETRIEVAL_DOCUMENT"` when embedding chunks at ingestion time, `task_type="RETRIEVAL_QUERY"` when embedding a search query. This is a parameter on one interface, not a vendor-specific branch in calling code.
+* **SDK:** the `google-genai` Python package.
+* **New secret:** `GEMINI_API_KEY` (SECURITY.md §7 — never committed; placeholder only in `.env.example`).
+* `DocumentChunk.token_count` (DATA_MODEL.md §7) is populated by a simple, dependency-free chars/4 length heuristic, used only to size chunks against `CHUNK_TARGET_TOKENS`/`CHUNK_OVERLAP_TOKENS`. It is an approximation, not an exact Gemini token count — consistent with RAG_SYSTEM.md §9 describing the 400–700-token target as "starting values, not permanent architecture rules."
+
+## Rationale
+
+* Anthropic (the model family this environment runs on) does not publish its own embeddings API, so an embedding-specific vendor choice was unavoidable regardless of which LLM Phase 6 eventually picks for generation.
+* Gemini's embedding model supports configurable output dimensionality and explicit retrieval task types, which map directly onto the asymmetric document/query embedding distinction RAG_SYSTEM.md's pipeline already implies without adding provider-specific concepts to the `EmbeddingProvider` interface itself.
+* 768 dimensions keeps the pgvector column and any future ANN index (RAG_SYSTEM.md §18) reasonably sized for the Northstar-scale corpus while remaining a well-supported truncation point for this model family.
+
+## Alternatives
+
+* **OpenAI `text-embedding-3-small`:** rejected for now — no stronger fit than Gemini for this project, and the user's explicit choice was Gemini.
+* **Voyage AI:** Anthropic's own recommended embedding partner; a reasonable alternative, not selected per explicit user direction.
+* **Local `sentence-transformers` model (fully offline):** rejected — would add a heavy dependency (torch) to the deployed API image (SECURITY.md §35: dependency additions must be justified) for a benefit (no API key) that is not durable, since Phase 6's agent will need an LLM provider API key regardless.
+
+## Consequences
+
+* `app/infrastructure/embeddings/` holds the `EmbeddingProvider` protocol and the concrete `GeminiEmbeddingProvider`; a `FakeEmbeddingProvider` is used for all automated tests (TESTING.md §30 — no live paid API calls in normal test runs).
+* `DocumentChunk.embedding` is a `pgvector.sqlalchemy.Vector(768)` column (ADR-004, ADR-026).
+* Re-embedding at a different dimension or model in the future is an intentional re-indexing operation, not a silent mix of incompatible vector spaces (RAG_SYSTEM.md §14) — `embedding_model`/`embedding_version` on `DocumentChunk` record what produced each stored vector.
+
+---
+
+# ADR-026 — pgvector Postgres Image and arq Activation for Embedding Generation
+
+## Context
+
+ADR-004 chose pgvector for vector storage, but the Postgres image actually in use (`postgres:16-alpine`, both in `docker-compose.yml` and in `Makefile`'s disposable test containers, ADR-022) does not ship the `vector` extension binary — `CREATE EXTENSION vector` fails against it. Separately, ADR-024 selected arq as the background worker technology and explicitly named Phase 4 as "the phase that must actually add arq to `docker-compose.yml`... and wire embedding generation through it," with document/CSV parsing (Phase 3) staying synchronous by design.
+
+## Decision
+
+* Switch the Postgres image used by both the dev stack (`docker-compose.yml`) and the disposable test containers (`Makefile`'s `test-infra-up`) from `postgres:16-alpine` to **`pgvector/pgvector:pg16`** — the official image bundling the same Postgres 16 with the `vector` extension prebuilt. This is a direct, mechanical consequence of ADR-004, not a new architectural choice.
+* Activate arq for embedding generation only, per ADR-024's already-recorded plan:
+  * Document ingestion (`DocumentIngestionService`) still performs parsing and **chunking** synchronously inside the upload request — chunking is pure CPU work with no external I/O, same reasoning ADR-024 already applied to Phase 3 parsing.
+  * `DocumentChunk.embedding` is created as `NULL` and filled in asynchronously: after chunks are persisted, an arq job (`generate_embeddings`, `app/infrastructure/jobs/tasks.py`) is enqueued for that document.
+  * The task is a thin wrapper around `EmbeddingGenerationService.generate_for_document()` (`app/application/retrieval/embedding_service.py`) — the same service method is called directly by tests and by the manual evaluation script, so neither depends on a running worker process (mirrors the pattern ADR-024 already prescribed for ingestion).
+  * All retrieval queries filter `WHERE embedding IS NOT NULL`, so a chunk whose embedding job hasn't run yet is simply not yet retrievable rather than causing an error.
+  * A new `worker` service is added to `docker-compose.yml`, running `arq app.infrastructure.jobs.worker.WorkerSettings` against the same Postgres/Redis as `api`, bypassing `entrypoint.sh` (which hardcodes `alembic upgrade head` + uvicorn — only `api` should run migrations, to avoid two containers racing to migrate on startup).
+
+## Rationale
+
+* `pgvector/pgvector:pg16` is the pgvector project's own maintained image; adding the extension via a custom Dockerfile layer instead would duplicate work the upstream project already does correctly.
+* Splitting "chunking" (sync) from "embedding" (async) at exactly the CPU/network-I/O boundary keeps the fast, deterministic part of ingestion inside the request/response cycle (so upload tests and UI status remain simple) while moving the genuinely slow, rate-limited, retryable part (RAG_SYSTEM.md §42, ARCHITECTURE.md §22) off the request path — this is the specific workload ADR-024 named as arq's justification.
+* Nullable `embedding` + a `WHERE embedding IS NOT NULL` retrieval filter is simpler than adding a separate chunk-level or document-level "embedding status" enum, and requires no new status field on `Document`/`DataSource`.
+
+## Alternatives
+
+* **Build a custom Postgres image with `CREATE EXTENSION` scripting on top of `postgres:16-alpine`:** rejected — reinvents what `pgvector/pgvector:pg16` already provides, for no benefit.
+* **Keep embedding generation synchronous inside the upload request (as Phase 3 did for parsing):** rejected — ADR-024 already committed Phase 4 to activating arq specifically for embedding generation; treating Gemini API latency/rate limits as acceptable inside a user-facing upload request would also work against RAG_SYSTEM.md §38's latency tracking intent and PRODUCT.md's demo responsiveness target.
+* **A separate `Document.embedding_status` enum instead of nullable `DocumentChunk.embedding`:** deferred — adds a second source of truth to keep in sync with the actual per-chunk embedding state; revisit only if a product need for document-level "fully indexed" status emerges.
+
+## Consequences
+
+* `apps/api/pyproject.toml` gains `arq` and `pgvector` as core (non-dev) dependencies.
+* `make test-api`'s disposable Postgres container now runs `pgvector/pgvector:pg16`; the Alembic migration introducing `DocumentChunk` includes `CREATE EXTENSION IF NOT EXISTS vector`.
+* Local `make up` requires a real `GEMINI_API_KEY` in `.env` for the worker to actually produce non-null embeddings; without one, chunks are created but remain unembedded and therefore unretrievable, failing closed rather than silently returning wrong results (SECURITY.md §39).
+
+---
+
+# ADR-027 — Recorded Vector-Only Retrieval Baseline (RAG_SYSTEM.md §37 Gate)
+
+## Context
+
+RAG_SYSTEM.md §37 requires implementing and evaluating simple vector retrieval before adding lexical retrieval, fusion, or reranking, and requires that each later stage clear a measured improvement over this baseline before being kept. `scripts/evaluate_retrieval.py` (BACKLOG.md 4.10) was built and, once a real `GEMINI_API_KEY` was available, run live against the 5 `retrieval`-tagged questions in the canonical evaluation question bank (DATASET.md §33), with all 5 Northstar business documents ingested, chunked, and embedded through the real pipeline (Phase 4 Increments 1-6).
+
+## Decision
+
+Record the following as the vector-only baseline, measured live (not estimated), K=5:
+
+| Metric | Value |
+|---|---|
+| Recall@5 | 1.00 (5/5) |
+| Precision@5 | 0.20 |
+| MRR | 1.00 |
+
+Per-question detail: all 5 questions retrieved their expected document, ranked first (rank 1), with the `expected_fact` substring present in the matching chunk's content in all 5 cases.
+
+## Rationale for what this means for 4.5-4.7
+
+Recall@5 and MRR are already at their maximum possible value (1.00). No retrieval algorithm change (lexical retrieval, fusion, or reranking) can measurably improve a metric that has already reached its ceiling — there is no headroom left to demonstrate an improvement against. Precision@5 = 0.20 is not a ranking-quality artifact: the entire Northstar document corpus contains exactly 5 documents (5 chunks, one per document, at current chunk sizes), so any K=5 query mechanically retrieves every chunk in the corpus, capping precision at 1/5 regardless of ranking algorithm. This matches RAG_SYSTEM.md §37's own prediction: "the Northstar document corpus is small... lexical retrieval and reranking are not assumed to be net-positive at this corpus size."
+
+This is exactly the outcome the evaluation gate exists to catch. Per RAG_SYSTEM.md §37, "a stage that fails its gate is removed or left disabled, not kept 'for completeness.'" BACKLOG.md 4.5-4.7 are still implemented and comparatively evaluated (not skipped outright) so the "implement → evaluate → compare" procedure is followed literally rather than assumed from this reasoning alone — but the a priori expectation, recorded here before that work begins, is that none of them will be adopted as the default active retrieval path for the Northstar-scale corpus.
+
+## Consequences
+
+* Vector-only retrieval (`VectorSearchService`, Increment 5) remains the active default retrieval path unless a later increment's comparative live evaluation shows a measured improvement.
+* Any future increase in corpus size (more documents, more workspaces) that changes this calculus should re-run `make evaluate-retrieval` rather than assume this baseline still holds — a larger corpus removes the "precision capped by total corpus size" artifact and gives lexical/fusion/reranking real headroom to prove (or fail to prove) value.
+
+---
+
+# ADR-028 — Lexical Retrieval: PostgreSQL Full-Text Search
+
+## Context
+
+BACKLOG.md 4.5 requires selecting and recording a PostgreSQL lexical search approach before implementing it. RAG_SYSTEM.md §17 names PostgreSQL full-text search as the candidate implementation, to be benchmarked before introducing additional infrastructure (a dedicated search engine such as Elasticsearch/Typesense/Meilisearch was never seriously in scope — CLAUDE.md §3/§4 already excludes infrastructure not clearly needed, and RAG_SYSTEM.md §17 itself frames Postgres FTS as the thing to benchmark, not one option among several to weigh from scratch).
+
+## Decision
+
+Use PostgreSQL's built-in full-text search:
+
+* A generated, stored `content_tsv tsvector` column on `document_chunks` (`GENERATED ALWAYS AS (to_tsvector('english', content)) STORED`) — Postgres keeps it in sync with `content` automatically; the application never writes to it.
+* A GIN index on `content_tsv` for query performance.
+* Query-time, `websearch_to_tsquery('english', query)` (not the lower-level `plainto_tsquery`/`to_tsquery`) — it accepts ordinary phrasing (quoted phrases, "or", "-exclude") close to how a business question is actually typed, rather than requiring tsquery's own operator syntax.
+* Ranking via `ts_rank`, matching only rows where `content_tsv @@ tsquery` (non-matching rows are excluded, not merely ranked last).
+* `DocumentChunkRepository.search_by_text(workspace_id, query, limit)` mirrors `search_by_embedding`'s shape (same workspace-scoping pattern, same `(DocumentChunk, score)` return shape) so both can feed a common fusion step (BACKLOG.md 4.6).
+
+## Rationale
+
+* No new infrastructure: Postgres is already the primary datastore (ADR-003); a generated column + GIN index adds no new service, dependency, or operational surface.
+* `GENERATED ALWAYS ... STORED` removes an entire class of bugs (chunk content updated but tsvector not refreshed) by construction — there is no application code path that could let the two drift apart.
+* `websearch_to_tsquery` over `plainto_tsquery`: business questions in this project (e.g. "What is the standard delivery window?") are natural sentences, and `websearch_to_tsquery` degrades gracefully on them while still supporting quoted-phrase/exclusion syntax if a caller (or a future agent tool) uses it.
+
+## Alternatives
+
+* **Elasticsearch/OpenSearch/Meilisearch/Typesense:** rejected — introduces a new service, new operational surface, and a second index to keep consistent with Postgres, for a corpus of 5 documents. Revisit only if a measured need at real scale emerges (CLAUDE.md §3).
+* **`plainto_tsquery`/`to_tsquery` instead of `websearch_to_tsquery`:** rejected as the primary query function — `to_tsquery` requires callers to already speak tsquery's boolean operator syntax, and `plainto_tsquery` silently ANDs every word together with no phrase/exclusion support, both a worse fit for natural-language business questions than `websearch_to_tsquery`.
+* **A trigger-maintained tsvector column instead of `GENERATED ALWAYS`:** rejected — Postgres 12+'s generated-column support does the same job with less code and no trigger to maintain.
+
+## Consequences
+
+* New Alembic migration (`f47b2e6a9c31`) adds `content_tsv` + its GIN index; no application code ever writes to `content_tsv`.
+* `search_by_text`'s output feeds BACKLOG.md 4.6 (hybrid fusion) — see ADR-027 for why, at Northstar's current corpus size, this stage is not expected to change the already-at-ceiling Recall@5/MRR baseline, and Increment 8 records the actual measured comparison rather than assuming this.
+
+---
+
+# ADR-029 — Hybrid Fusion Strategy: Reciprocal Rank Fusion (k=60)
+
+## Context
+
+BACKLOG.md 4.6 requires combining vector (ADR-025) and lexical (ADR-028) retrieval into one ranked result list. RAG_SYSTEM.md §20 names Reciprocal Rank Fusion (RRF) as the initial preferred strategy and requires the exact formula/configuration to be documented during implementation.
+
+## Decision
+
+* **Formula:** for each retriever's ranked result list, assign `1 / (k + rank)` to each chunk (`rank` is 1-indexed); a chunk's fused score is the sum of this value across every list it appears in (0 if absent from a list).
+* **k = 60** — RRF's standard/original-paper constant. Large enough that neither retriever's #1-vs-#2 ordering alone dominates the fused ranking.
+* **Candidate pool:** each retriever (vector, lexical) contributes its own top `RETRIEVAL_CANDIDATE_LIMIT` (15, RAG_SYSTEM.md §19) results as fusion input; the fused list is then truncated to the caller's requested `limit`.
+* **Deduplication:** by stable `chunk_id` (RAG_SYSTEM.md §21) — a chunk appearing in both retrievers' candidate lists is represented once, retaining whichever underlying `vector`/`lexical` score(s) are available on it.
+* Implemented in `HybridSearchService` (`application/retrieval/hybrid_search_service.py`), composing the existing `VectorSearchService` and new `LexicalSearchService` — **not** the active default retrieval path; see the Evaluation Result section below (added once Increment 8's live comparison runs) for the keep/discard decision.
+
+## Rationale
+
+* RRF requires no normalization between vector cosine-similarity and lexical `ts_rank` scores, which are not on comparable scales — it only needs each list's relative ordering, which is exactly what both retrievers already produce.
+* It is simple and interpretable (RAG_SYSTEM.md §20's own stated reasons), with a single tunable constant rather than a learned weighting scheme.
+
+## Alternatives
+
+* **Weighted linear combination of normalized scores:** rejected — requires choosing a normalization scheme for two structurally different score types (cosine similarity vs. `ts_rank`) and a weighting hyperparameter, adding tuning surface RRF avoids entirely.
+* **A different `k`:** rejected — 60 is RRF's well-established default; there is no Northstar-specific evidence yet to justify a different value, and introducing one without justification would be tuning without a signal to tune against.
+
+## Consequences
+
+* `RetrievalResult`/`RetrievalScores` (`application/retrieval/results.py`) now carry `vector`, `lexical`, and `fusion` fields (matching RAG_SYSTEM.md §26's example schema) so any retrieval stage's output — vector-only, lexical-only, or fused — flows through one shared shape.
+* The live comparison against ADR-027's vector-only baseline is recorded as an update to this ADR once `make evaluate-retrieval` is run, per RAG_SYSTEM.md §37's gate.
+
+## Evaluation Result (RAG_SYSTEM.md §37 Gate) — Hybrid Does Not Clear the Gate
+
+`make evaluate-retrieval` was run live (real Gemini calls) comparing `HybridSearchService` (this ADR) against the `VectorSearchService` baseline (ADR-027), same 5 `retrieval`-tagged questions, K=5:
+
+| Metric | Vector-only | Hybrid (RRF) | Delta |
+|---|---|---|---|
+| Recall@5 | 1.00 | 1.00 | +0.00 |
+| Precision@5 | 0.20 | 0.20 | +0.00 |
+| MRR | 1.00 | 1.00 | +0.00 |
+
+No metric improved. This confirms ADR-027's prediction exactly: Recall/MRR were already at their ceiling (1.00), leaving no headroom for any fusion strategy to improve them, and Precision@5 is capped by the 5-chunk total corpus size regardless of ranking method.
+
+**Decision: hybrid fusion does not clear the RAG_SYSTEM.md §37 gate at Northstar's current corpus size.** Per §37, "a stage that fails its gate is removed or left disabled, not kept 'for completeness.'" `VectorSearchService` (vector-only) remains the sole active default retrieval path. `HybridSearchService`/`LexicalSearchService` remain in the codebase (tested, working) but are not wired into any default-path caller — they are available to be revisited if the corpus grows enough to give this comparison real headroom (see ADR-027's Consequences).
+
+---
+
+# ADR-030 — Reranker Selection: Gemini Generation, Structured Relevance Scoring
+
+## Context
+
+BACKLOG.md 4.7 requires selecting and recording a reranker before implementing it. RAG_SYSTEM.md §22 names three candidate approaches: a dedicated cross-encoder, a provider reranking API, or carefully constrained model-based reranking. ADR-025 already established Google Gemini as this project's model provider for embeddings.
+
+## Decision
+
+Use **carefully constrained Gemini-generation-based reranking**:
+
+* Model: `gemini-flash-latest` (configurable via `RERANKER_MODEL`) — Google's rolling alias for its current fast/low-cost generation model, appropriate for a scoring task rather than open-ended generation. Using the rolling alias rather than a dated snapshot (e.g. `gemini-2.5-flash`, which stopped being available to this project partway through this phase) avoids re-breaking when Google retires a specific snapshot.
+* Structured JSON output (ADR-011) via `response_schema`/`response_mime_type="application/json"`: the model returns `{"scores": [{"index": int, "relevance_score": float}, ...]}`, one entry per candidate — never free-form prose to parse.
+* Input per RAG_SYSTEM.md §23: query + candidate content only (truncated to 1000 characters per candidate), no full source document, no unnecessary metadata.
+* Retrieved candidate text is explicitly framed in the prompt as untrusted evidence to score, not instructions to follow (SECURITY.md §15-16, RAG_SYSTEM.md §29/§31) — consistent with how retrieved content is treated everywhere else in the system.
+* Bounded retry only on transient failures (5xx, 429), same policy as `GeminiEmbeddingProvider` (ADR-025).
+* Latency and token usage are logged per call (`duration_ms`, `prompt_token_count`, `candidates_token_count`) — satisfies BACKLOG.md 4.7's "track latency/cost" at the log level; persisted, queryable observability is Phase 9 scope (ARCHITECTURE.md §20).
+* Implemented as `GeminiReranker` (`infrastructure/rerankers/gemini_reranker.py`) behind a narrow `Reranker` protocol (`infrastructure/rerankers/base.py`), composed with any base search service via `RerankingService` (`application/retrieval/reranking_service.py`) — mirrors the `EmbeddingProvider`/`HybridSearchService` composition pattern already established in this phase.
+* Reranks on top of the vector-only baseline's candidates (not the hybrid-fused candidates), since ADR-029 already found fusion does not improve on vector-only at Northstar's scale — reranking is evaluated against the current best-performing pipeline, per RAG_SYSTEM.md §37's sequential baseline-first procedure.
+
+## Rationale
+
+* Reuses the already-established Gemini vendor relationship (ADR-025) rather than introducing a third AI vendor (e.g. Cohere's dedicated Rerank API) purely for this one stage, avoiding a new account, API key, and dependency for a corpus this small.
+* Structured output removes the "parse the model's prose" failure mode entirely — the model cannot return an ambiguous or partially-parseable response by construction.
+* A fast/cheap generation model is appropriate here: the task is bounded scoring over ≤15 short candidates, not long-form generation.
+
+## Alternatives
+
+* **Cohere Rerank API (dedicated reranking endpoint):** a reasonable alternative and arguably more purpose-built, but rejected for V1 — a third vendor/API key for one pipeline stage is not justified before this stage has even cleared its evaluation gate.
+* **A local cross-encoder (e.g. sentence-transformers):** rejected for the same reason ADR-025 rejected a local embedding model — adds a heavy dependency (torch) to the deployed API image for a benefit not yet proven to matter at this corpus size.
+* **Free-form text generation, parsed with regex/heuristics:** rejected — exactly the "unconstrained prose" pattern ADR-011 and ARCHITECTURE.md §13 warn against when application logic depends on the output shape.
+
+## Consequences
+
+* New core dependency surface: none (`google-genai`, already a dependency per ADR-025, also provides `generate_content`).
+* The live comparison against the current best baseline (vector-only, ADR-027) is recorded as an update to this ADR once `make evaluate-retrieval` is run with reranking included, per RAG_SYSTEM.md §37's gate.
+
+## Evaluation Result (RAG_SYSTEM.md §37 Gate) — Reranking Does Not Clear the Gate
+
+`make evaluate-retrieval` was run live (real Gemini embedding + generation calls) comparing vector-only candidates reranked by `GeminiReranker` against the `VectorSearchService` baseline (ADR-027), same 5 `retrieval`-tagged questions, K=5:
+
+| Metric | Vector-only | Hybrid (RRF) | +Reranking |
+|---|---|---|---|
+| Recall@5 | 1.00 | 1.00 | 1.00 |
+| Precision@5 | 0.20 | 0.20 | 0.20 |
+| MRR | 1.00 | 1.00 | 1.00 |
+
+Identical to both the vector-only baseline and the hybrid fusion result — no metric changed. This is the same structural finding as ADR-029: Recall/MRR were already at their ceiling, and Precision@5 remains capped by the 5-chunk total corpus size, leaving no headroom for reranking (or any other stage) to demonstrate improvement.
+
+**Decision: reranking does not clear the RAG_SYSTEM.md §37 gate at Northstar's current corpus size.** `VectorSearchService` (vector-only, no reranking) remains the sole active default retrieval path. `GeminiReranker`/`RerankingService` remain in the codebase (tested, working, verified against a real live run) but are not wired into any default-path caller — available to be revisited if a larger corpus gives this comparison real headroom (see ADR-027's Consequences, which applies identically here).

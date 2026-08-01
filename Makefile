@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack generate-northstar
+.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack generate-northstar evaluate-retrieval
 
 TEST_PG_CONTAINER := opspilot-test-pg
 TEST_REDIS_CONTAINER := opspilot-test-redis
@@ -23,7 +23,7 @@ test-infra-up:
 	docker rm -f $(TEST_PG_CONTAINER) $(TEST_REDIS_CONTAINER) >/dev/null 2>&1 || true
 	docker run -d --name $(TEST_PG_CONTAINER) \
 		-e POSTGRES_USER=opspilot -e POSTGRES_PASSWORD=opspilot -e POSTGRES_DB=opspilot \
-		-p $(TEST_DB_PORT):5432 postgres:16-alpine >/dev/null
+		-p $(TEST_DB_PORT):5432 pgvector/pgvector:pg16 >/dev/null
 	docker run -d --name $(TEST_REDIS_CONTAINER) -p $(TEST_REDIS_PORT):6379 redis:7-alpine >/dev/null
 	until docker exec $(TEST_PG_CONTAINER) pg_isready -U opspilot >/dev/null 2>&1; do sleep 1; done
 
@@ -49,3 +49,10 @@ verify-stack:
 # generated data fails DATASET.md's validation checks (§30).
 generate-northstar:
 	cd apps/api && . .venv/bin/activate && cd ../.. && PYTHONPATH=scripts python -m northstar.generate
+
+# Live retrieval evaluation gate (RAG_SYSTEM.md §37, BACKLOG.md 4.10).
+# Requires: `make up` (dev Postgres reachable), a real GEMINI_API_KEY in
+# .env, and `make generate-northstar` already run. Makes real, paid Gemini
+# API calls — never run as part of test-api / CI.
+evaluate-retrieval:
+	cd apps/api && . .venv/bin/activate && cd ../.. && python scripts/evaluate_retrieval.py

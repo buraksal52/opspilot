@@ -342,100 +342,105 @@ Per ROADMAP.md §7: "Northstar structured and unstructured data can be loaded in
 
 ## 4.1 DocumentChunk
 
-* [ ] Implement DocumentChunk model
-* [ ] Add pgvector extension
-* [ ] Add vector column
-* [ ] Add migration
+* [x] Implement DocumentChunk model — `app/domain/document_chunk.py` + `infrastructure/database/models/document_chunk.py` (`app` schema, per DATA_MODEL.md §2 ERD)
+* [x] Add pgvector extension — `CREATE EXTENSION IF NOT EXISTS vector` in the new migration; Postgres image switched to `pgvector/pgvector:pg16` in `docker-compose.yml` and `Makefile` (ADR-026, since plain `postgres:16-alpine` doesn't ship it)
+* [x] Add vector column — `embedding: Vector(768)`, nullable (filled asynchronously by the arq embedding job, ADR-026), dimension fixed by ADR-025
+* [x] Add migration — `e3a1c9f4b2d7_add_document_chunks_table.py`, verified against a real `pgvector/pgvector:pg16` container via `make test-api` (100/100 passing, including new `tests/integration/test_document_chunk_repository.py` covering bulk-create, missing-embedding lookup, cosine-distance ranking, and cross-workspace isolation)
 
 ---
 
 ## 4.2 Chunking
 
-* [ ] Implement baseline chunking strategy
-* [ ] Preserve page metadata
-* [ ] Preserve section metadata where available
-* [ ] Track token counts
-* [ ] Add deterministic chunking tests
+* [x] Implement baseline chunking strategy — `app/application/retrieval/chunking_service.py`: page-structure-aware for PDF (`Document.metadata["pages"]`), paragraph-based fallback for Markdown/text, target/overlap tokens from settings, oversized-paragraph word-packing fallback; wired synchronously into `DocumentIngestionService.ingest()` (ADR-026 — chunking is CPU-only, stays sync)
+* [x] Preserve page metadata — a chunk never spans two PDF pages (page atomicity enforced for citation precision, RAG_SYSTEM.md §8/§10)
+* [x] Preserve section metadata where available — Markdown `#`/`##`/... headings become `section_title`, carried until the next heading; left `None` for PDF (no heading syntax survives text extraction, so not fabricated)
+* [x] Track token counts — approximate chars/4 heuristic (`estimate_token_count`), documented in ADR-025 as a sizing estimate, not an exact provider token count
+* [x] Add deterministic chunking tests — `tests/unit/test_chunking.py` (no content loss, determinism, overlap, page/section metadata, oversized-paragraph splitting) + `tests/api/test_data_source_upload.py::test_upload_pdf_creates_document_chunks` (real API + real Postgres, verifies chunks are created and unembedded after upload)
 
 ---
 
 ## 4.3 Embeddings
 
-* [ ] Define EmbeddingProvider interface
-* [ ] Implement initial provider
-* [ ] Implement batch embedding
-* [ ] Store embedding model metadata
-* [ ] Handle failures
-* [ ] Add tests
+* [x] Define EmbeddingProvider interface — `infrastructure/embeddings/base.py` (`EmbeddingProvider` Protocol, `EmbeddingTaskType`, ADR-025)
+* [x] Implement initial provider — `infrastructure/embeddings/gemini_provider.py` (Google Gemini `gemini-embedding-001`, ADR-025) + `infrastructure/embeddings/fake_provider.py` (deterministic, used by all automated tests per TESTING.md §30)
+* [x] Implement batch embedding — bounded batch size (32) inside `GeminiEmbeddingProvider.embed_batch`
+* [x] Store embedding model metadata — `DocumentChunk.embedding_model`/`embedding_version` set by `EmbeddingGenerationService` (`application/retrieval/embedding_service.py`)
+* [x] Handle failures — bounded retry on transient errors only (5xx, 429), immediate raise as `EmbeddingProviderError` otherwise (ARCHITECTURE.md §22); background execution via arq (ADR-024/ADR-026, `infrastructure/jobs/{worker,tasks,queue}.py`), enqueued from `UploadService` after synchronous chunk creation
+* [x] Add tests — `tests/unit/test_embedding_provider_contract.py`, `tests/unit/test_gemini_embedding_provider.py` (mocked client — success, server-error retry, rate-limit retry, non-transient no-retry, retry exhaustion), `tests/integration/test_embedding_job.py` (real Postgres/Redis — end-to-end generate_for_document + real arq enqueue). Additionally verified manually against a real `docker compose up` stack (worker container consumed a real enqueued job for an uploaded Northstar PDF and correctly surfaced a Gemini `API_KEY_INVALID` error without crashing, using a placeholder key)
 
 ---
 
 ## 4.4 Vector Retrieval
 
-* [ ] Implement workspace-scoped vector retrieval
-* [ ] Define candidate limit
-* [ ] Capture similarity score
-* [ ] Add known-query tests
+* [x] Implement workspace-scoped vector retrieval — `DocumentChunkRepository.search_by_embedding` (added in Increment 2, exercised here) + `application/retrieval/vector_search_service.py::VectorSearchService`, plain sequential scan over pgvector cosine distance (no ANN index yet — RAG_SYSTEM.md §18, acceptable at Northstar's corpus size)
+* [x] Define candidate limit — `RETRIEVAL_CANDIDATE_LIMIT` setting (default 15, RAG_SYSTEM.md §19), passed as `limit` to `VectorSearchService.search`
+* [x] Capture similarity score — `RetrievalResult.vector_score` (`1 - cosine_distance`, matching RAG_SYSTEM.md §26's `scores.vector` convention)
+* [x] Add known-query tests — `tests/integration/test_vector_search_service.py`: ranking order with a controllable stub embedding provider, cross-workspace isolation, empty result when no chunks are embedded yet
 
 ---
 
 ## 4.5 Lexical Retrieval
 
-* [ ] Select PostgreSQL lexical search approach
-* [ ] Record decision
-* [ ] Implement indexing
-* [ ] Implement workspace-scoped lexical retrieval
-* [ ] Add tests
+* [x] Select PostgreSQL lexical search approach — built-in full-text search: generated `tsvector` column + GIN index + `websearch_to_tsquery`/`ts_rank` (ADR-028)
+* [x] Record decision — ADR-028
+* [x] Implement indexing — migration `f47b2e6a9c31` (`content_tsv GENERATED ALWAYS AS (to_tsvector('english', content)) STORED` + GIN index)
+* [x] Implement workspace-scoped lexical retrieval — `DocumentChunkRepository.search_by_text`
+* [x] Add tests — `tests/integration/test_document_chunk_repository.py`: keyword match + ranking, non-matching exclusion, workspace isolation
 
 ---
 
 ## 4.6 Hybrid Fusion
 
-* [ ] Implement candidate deduplication
-* [ ] Implement RRF or approved fusion strategy
-* [ ] Preserve individual scores
-* [ ] Add retrieval trace structure
+* [x] Implement candidate deduplication — `HybridSearchService` merges by stable `chunk_id` (RAG_SYSTEM.md §21)
+* [x] Implement RRF or approved fusion strategy — Reciprocal Rank Fusion, k=60 (ADR-029), `application/retrieval/hybrid_search_service.py`
+* [x] Preserve individual scores — `RetrievalScores` (`vector`/`lexical`/`fusion`/`rerank`, `application/retrieval/results.py`) matches RAG_SYSTEM.md §26's example schema
+* [x] Add retrieval trace structure — every `RetrievalResult` carries all contributing scores together (which retriever(s) found it, at what score); full persisted observability logging of retrieval traces is Phase 9 scope (ARCHITECTURE.md §20), not part of Phase 4
+* **Evaluation gate result (ADR-029): hybrid fusion does NOT clear RAG_SYSTEM.md §37's gate** — live comparison showed zero improvement over vector-only (Recall@5/Precision@5/MRR all identical, 1.00/0.20/1.00). Vector-only (`VectorSearchService`) remains the active default; `HybridSearchService`/`LexicalSearchService` exist, are tested, but are not wired into any default retrieval path.
 
 ---
 
 ## 4.7 Reranking
 
-* [ ] Select reranker
-* [ ] Record decision
-* [ ] Implement reranking interface
-* [ ] Implement initial reranker
-* [ ] Track latency/cost
-* [ ] Add evaluation comparison
+* [x] Select reranker — Gemini generation-based reranking (`gemini-2.5-flash`, structured JSON scoring), ADR-030
+* [x] Record decision — ADR-030
+* [x] Implement reranking interface — `infrastructure/rerankers/base.py::Reranker` protocol
+* [x] Implement initial reranker — `infrastructure/rerankers/gemini_reranker.py::GeminiReranker` + `application/retrieval/reranking_service.py::RerankingService` (wraps any base search service)
+* [x] Track latency/cost — per-call `duration_ms`/`prompt_token_count`/`candidates_token_count` logged (persisted observability is Phase 9 scope)
+* [x] Add evaluation comparison — run live against real Gemini: **identical to vector-only on all three metrics** (Recall@5/Precision@5/MRR = 1.00/0.20/1.00, no change). Does not clear the RAG_SYSTEM.md §37 gate (ADR-030). Vector-only (no reranking) remains the active default. (Note: `RERANKER_MODEL` default was corrected from `gemini-2.5-flash`, retired for new users mid-increment, to the rolling alias `gemini-flash-latest`.)
 
 ---
 
 ## 4.8 Context Selection
 
-* [ ] Implement token-aware context selection
-* [ ] Reduce duplicate evidence
-* [ ] Preserve source diversity
-* [ ] Return structured evidence
+* [x] Implement token-aware context selection — `application/retrieval/context_selection_service.py::ContextSelectionService`, `CONTEXT_TOKEN_BUDGET` setting (default 4000, RAG_SYSTEM.md §25 — deliberately well below typical model context windows)
+* [x] Reduce duplicate evidence — word-overlap (Jaccard ≥0.8) redundancy check drops near-duplicate chunks against already-selected ones
+* [x] Preserve source diversity — a side effect of redundancy avoidance (RAG_SYSTEM.md §24: "prefer evidence diversity when several chunks express the same information"), not a separate quota mechanism the docs didn't ask for
+* [x] Return structured evidence — reuses `RetrievalResult` (already structured per RAG_SYSTEM.md §26); no new wrapper type needed
+* Tests — `tests/unit/test_context_selection_service.py`: budget cutoff, always-keep-first-candidate, redundancy dropping, order preservation, empty input
 
 ---
 
 ## 4.9 RAG Citations
 
-* [ ] Generate stable evidence IDs
-* [ ] Include source metadata
-* [ ] Validate evidence references
-* [ ] Add citation tests
+* [x] Generate stable evidence IDs — `DocumentChunk.id` (a UUID, already stable per DATA_MODEL.md §7) serves as the evidence ID directly; nothing new to mint
+* [x] Include source metadata — already carried on every `RetrievalResult` (document title, page, section)
+* [x] Validate evidence references — `application/retrieval/citation_service.py::CitationValidationService`: a cited `chunk_id` is valid only if present in the actual retrieved/workspace-scoped result set for that query, which simultaneously proves existence + workspace ownership + "was actually retrieved" (RAG_SYSTEM.md §28's three checks) in one lookup; unsupported IDs raise rather than silently drop (SECURITY.md §39, fail closed)
+* [x] Add citation tests — `tests/unit/test_citation_service.py`: valid resolution, rejection of fabricated/foreign IDs, ordering, empty input
+* Note: this validates citations against a given retrieval result set now; there is no agent yet (Phase 6) to actually produce cited claims, and no persisted `Evidence` table yet (Phase 8) — this closes the RAG-layer half of the citation contract that Phase 6/8 will call into.
 
 ---
 
 ## 4.10 Retrieval Evaluation
 
-* [ ] Create retrieval evaluation questions
-* [ ] Implement Recall@K
-* [ ] Implement Precision@K
-* [ ] Implement MRR
-* [ ] Record vector baseline
-* [ ] Compare hybrid retrieval
-* [ ] Compare reranking
+* [x] Create retrieval evaluation questions — already exists: the 5 `retrieval`-tagged entries in the canonical `data/northstar/eval/evaluation_questions.json` (DATASET.md §33, produced in Phase 2); no separate question set was created for this phase, per DATASET.md §33's "exactly one evaluation question file for the project"
+* [x] Implement Recall@K — `scripts/evaluate_retrieval.py` (K=5)
+* [x] Implement Precision@K — same script
+* [x] Implement MRR — same script
+* [x] Record vector baseline — run live against real Gemini: **Recall@5 = 1.00, Precision@5 = 0.20, MRR = 1.00** (ADR-027). Recall/MRR already at ceiling; Precision@5 is capped by the corpus containing only 5 total chunks, not by ranking quality.
+* [x] Compare hybrid retrieval — run live against real Gemini: identical to the vector-only baseline on all three metrics (delta = +0.00). Does not clear the RAG_SYSTEM.md §37 gate (ADR-029). Vector-only remains the active default.
+* [x] Compare reranking — run live against real Gemini: identical to vector-only/hybrid on all three metrics (delta = 0.00). Does not clear the RAG_SYSTEM.md §37 gate (ADR-030). Vector-only remains the active default.
+
+**Phase 4 RAG retrieval pipeline: complete.** Vector-only retrieval (`VectorSearchService`) is the active default, per three separate live-measured gate results (ADR-027/029/030) all showing no headroom for lexical/fusion/reranking to improve on an already-at-ceiling baseline at Northstar's 5-document corpus size. All three alternative stages (lexical, hybrid, reranking) are implemented, tested, and available to revisit if the corpus grows.
 
 ---
 

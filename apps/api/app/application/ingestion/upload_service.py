@@ -16,6 +16,7 @@ from app.application.ingestion.dataset_ingestion_service import DatasetIngestion
 from app.application.ingestion.document_ingestion_service import DocumentIngestionService
 from app.application.ingestion.upload_validation import validate_upload
 from app.infrastructure.database.repositories.data_source_repository import DataSourceRepository
+from app.infrastructure.jobs.queue import JobQueue
 from app.infrastructure.parsers.base import ParserError
 from app.infrastructure.storage.file_storage import FileStorage
 
@@ -34,12 +35,14 @@ class UploadService:
         file_storage: FileStorage,
         document_ingestion_service: DocumentIngestionService,
         dataset_ingestion_service: DatasetIngestionService,
+        job_queue: JobQueue,
         max_upload_size_bytes: int,
     ) -> None:
         self._data_sources = data_source_repository
         self._storage = file_storage
         self._documents = document_ingestion_service
         self._datasets = dataset_ingestion_service
+        self._job_queue = job_queue
         self._max_upload_size_bytes = max_upload_size_bytes
 
     async def upload(
@@ -79,7 +82,7 @@ class UploadService:
                     workspace_id=workspace_id, data_source_id=data_source.id, name=display_name, content=content
                 )
             else:
-                await self._documents.ingest(
+                document = await self._documents.ingest(
                     workspace_id=workspace_id,
                     data_source_id=data_source.id,
                     source_type=source_type,
@@ -94,6 +97,10 @@ class UploadService:
                 processed_at=datetime.now(UTC),
             )
         else:
+            if source_type != SourceType.CSV:
+                # Chunks already exist (synchronous, ADR-026); embedding
+                # generation is the async part, enqueued here.
+                await self._job_queue.enqueue_generate_embeddings(document.id)
             await self._data_sources.update_status(
                 data_source.id, status=DataSourceStatus.READY, processed_at=datetime.now(UTC)
             )

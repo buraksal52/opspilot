@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 = upstream postgres:16 + the `vector` extension
+    # binary preinstalled (ADR-004 chose pgvector; plain postgres:16-alpine
+    # does not ship it — ADR-026).
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-opspilot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opspilot}
@@ -35,6 +38,25 @@ services:
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    # Background embedding generation (ADR-024, activated per ADR-026).
+    # Same image as api, different process: an arq worker instead of uvicorn.
+    # entrypoint.sh is bypassed (it hardcodes `alembic upgrade head` + uvicorn,
+    # which only the api service should run) in favor of running arq directly.
+    build:
+      context: ./apps/api
+    entrypoint: ["arq", "app.infrastructure.jobs.worker.WorkerSettings"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-opspilot}:${POSTGRES_PASSWORD:-opspilot}@postgres:5432/${POSTGRES_DB:-opspilot}
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy

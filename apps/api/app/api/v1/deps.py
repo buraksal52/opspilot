@@ -1,4 +1,5 @@
 import uuid
+from functools import lru_cache
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -8,6 +9,7 @@ from app.application.auth.service import AuthService
 from app.application.ingestion.dataset_ingestion_service import DatasetIngestionService
 from app.application.ingestion.document_ingestion_service import DocumentIngestionService
 from app.application.ingestion.upload_service import UploadService
+from app.application.retrieval.chunking_service import ChunkingService
 from app.core.config import Settings, get_settings
 from app.core.errors import NotFoundError, UnauthorizedError
 from app.domain.data_source import DataSource
@@ -16,10 +18,12 @@ from app.domain.workspace import Workspace
 from app.infrastructure.auth.jwt_provider import JWTProvider, TokenError
 from app.infrastructure.auth.password_hasher import PasswordHasher
 from app.infrastructure.database.repositories.data_source_repository import DataSourceRepository
+from app.infrastructure.database.repositories.document_chunk_repository import DocumentChunkRepository
 from app.infrastructure.database.repositories.document_repository import DocumentRepository
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.repositories.workspace_repository import WorkspaceRepository
 from app.infrastructure.database.session import get_db
+from app.infrastructure.jobs.queue import ArqJobQueue, JobQueue
 from app.infrastructure.storage.file_storage import FileStorage, LocalFileStorage
 
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -100,14 +104,33 @@ def get_document_repository(session: AsyncSession = Depends(get_db)) -> Document
     return DocumentRepository(session)
 
 
+def get_document_chunk_repository(session: AsyncSession = Depends(get_db)) -> DocumentChunkRepository:
+    return DocumentChunkRepository(session)
+
+
+def get_chunking_service(settings: Settings = Depends(get_settings)) -> ChunkingService:
+    return ChunkingService(
+        target_tokens=settings.chunk_target_tokens, overlap_tokens=settings.chunk_overlap_tokens
+    )
+
+
 def get_document_ingestion_service(
     document_repository: DocumentRepository = Depends(get_document_repository),
+    document_chunk_repository: DocumentChunkRepository = Depends(get_document_chunk_repository),
+    chunking_service: ChunkingService = Depends(get_chunking_service),
 ) -> DocumentIngestionService:
-    return DocumentIngestionService(document_repository)
+    return DocumentIngestionService(document_repository, document_chunk_repository, chunking_service)
 
 
 def get_dataset_ingestion_service(session: AsyncSession = Depends(get_db)) -> DatasetIngestionService:
     return DatasetIngestionService(session)
+
+
+@lru_cache
+def get_job_queue() -> JobQueue:
+    # One pooled connection per process, lazily connected on first enqueue
+    # (mirrors infrastructure/redis/client.py::get_redis_client).
+    return ArqJobQueue(get_settings().redis_url)
 
 
 def get_upload_service(
@@ -115,6 +138,7 @@ def get_upload_service(
     file_storage: FileStorage = Depends(get_file_storage),
     document_ingestion_service: DocumentIngestionService = Depends(get_document_ingestion_service),
     dataset_ingestion_service: DatasetIngestionService = Depends(get_dataset_ingestion_service),
+    job_queue: JobQueue = Depends(get_job_queue),
     settings: Settings = Depends(get_settings),
 ) -> UploadService:
     return UploadService(
@@ -122,6 +146,7 @@ def get_upload_service(
         file_storage,
         document_ingestion_service,
         dataset_ingestion_service,
+        job_queue,
         settings.upload_max_size_bytes,
     )
 
