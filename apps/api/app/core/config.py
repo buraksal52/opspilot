@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # fill the context window merely because capacity exists."
     context_token_budget: int = 4000
 
+    # --- LLM generation (Phase 5, ADR-031) ---
+    llm_model: str = "gemini-flash-latest"
+
+    # --- Analytics SQL execution (Phase 5, ADR-032, SECURITY.md §10-14) ---
+    analytics_readonly_role: str = "opspilot_analytics_ro"
+    analytics_max_result_rows: int = 500
+    analytics_query_timeout_seconds: float = 5.0
+    # ANALYTICS_ENGINE.md §28: "allow one/few bounded correction attempts".
+    analytics_max_sql_generation_attempts: int = 2
+
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]

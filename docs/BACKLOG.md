@@ -448,84 +448,88 @@ Per ROADMAP.md §7: "Northstar structured and unstructured data can be loaded in
 
 ## 5.1 Dataset Catalog
 
-* [ ] Expose dataset metadata to analytics layer
-* [ ] Represent dataset relationships
-* [ ] Build bounded schema context
+* [x] Expose dataset metadata to analytics layer — `application/analytics/catalog_service.py::DatasetCatalogService`, built dynamically per request from the requesting workspace's READY `Dataset` records only (ADR-017); display names/columns only, never physical identifiers
+* [x] Represent dataset relationships — `application/analytics/known_relationships.py`, the exact four pairs documented in ANALYTICS_ENGINE.md §7/DATASET.md §31, resolved dynamically against whichever datasets actually exist in the workspace
+* [x] Build bounded schema context — `DatasetCatalog.render()`/`_render_selected_datasets()` (sql_generation_service.py) inject only the datasets a given plan actually selected, not the whole catalog (ANALYTICS_ENGINE.md §6)
 
 ---
 
 ## 5.2 Analysis Intent
 
-* [ ] Define structured analytical intent schema
-* [ ] Define analysis-plan schema
-* [ ] Implement model generation
-* [ ] Validate structured output
+* [x] Define structured analytical intent schema — `application/analytics/schemas.py::AnalyticalIntent`/`AnalysisPlan` (Pydantic, ADR-011)
+* [x] Define analysis-plan schema — same file, `AnalysisPlan.steps`
+* [x] Implement model generation — new `LLMProvider` abstraction (ADR-031) + `GeminiLLMProvider`/`FakeLLMProvider`; `application/analytics/planning_service.py::AnalysisPlanningService`
+* [x] Validate structured output — `generate_structured()` validates against the Pydantic model directly (google-genai `response_schema`), raising `LLMProviderError` on invalid output rather than returning unparsed prose
 
 ---
 
 ## 5.3 SQL Generation
 
-* [ ] Define SQL generation prompt
-* [ ] Generate SQL from approved schema context
-* [ ] Keep generated SQL observable
+* [x] Define SQL generation prompt — `application/analytics/sql_generation_service.py::SqlGenerationService`, display-names-only per ANALYTICS_ENGINE.md §5, explicit correction-prompt path for bounded retry
+* [x] Generate SQL from approved schema context — same service; only the plan-selected datasets' schema is included
+* [x] Keep generated SQL observable — `logger.info` per generation attempt in the orchestrator (`query_database_tool.py`); persisted/queryable observability remains Phase 9 scope (matches the pattern already established in Phase 4)
+* Identifier resolution (display name -> physical identifier, ANALYTICS_ENGINE.md §5) — `infrastructure/analytics/sql_resolver.py::resolve_identifiers`, AST-based (sqlglot, ADR-032) rewrite of `Table`/`Column` nodes, scope-aware (CTEs, GROUP BY/ORDER BY aliases). A real bug was caught and fixed via a live end-to-end run (`scripts/evaluate_analytics.py`): an unaliased table renamed to its physical identifier left dangling `orders.col_1`-style qualifiers elsewhere in the query — fixed by re-adding an alias equal to the original display name when none was explicit (`tests/unit/test_sql_resolver.py::test_unaliased_table_gets_an_alias_back_so_column_qualifiers_still_resolve`)
 
 ---
 
 ## 5.4 SQL Validator
 
-* [ ] Select SQL parser
-* [ ] Validate statement type
-* [ ] Reject multiple statements
-* [ ] Enforce schema allowlist (`analytics` only)
-* [ ] Build the table allowlist dynamically per request from the requesting workspace's Dataset records (ADR-017) — no static/hardcoded table list
-* [ ] Add cross-workspace test: query referencing another workspace's physical table must be rejected
-* [ ] Reject mutation/DDL
-* [ ] Enforce result bounds
-* [ ] Add extensive security tests
+* [x] Select SQL parser — `sqlglot` (ADR-032; pure-Python, no native extension, sufficient Postgres-dialect coverage for single-statement/table/function-level checks)
+* [x] Validate statement type — `infrastructure/analytics/sql_validator.py::validate_and_bound`: root must be `exp.Select` (covers both plain SELECT and WITH...SELECT)
+* [x] Reject multiple statements — stacked `;`-separated statements rejected (`tests/unit/test_sql_validator.py::test_rejects_stacked_statements`)
+* [x] Enforce schema allowlist (`analytics` only) — every table must be schema-qualified to `analytics`; `app`/unqualified references rejected
+* [x] Build the table allowlist dynamically per request from the requesting workspace's Dataset records (ADR-017) — no static/hardcoded table list — `AnalyticsQueryService._generate_valid_sql` builds `allowed_tables` from the workspace's own `DatasetCatalog.entries` each call
+* [x] Add cross-workspace test: query referencing another workspace's physical table must be rejected — `tests/integration/test_analytics_query_service.py::test_cross_workspace_physical_table_is_rejected_even_though_it_really_exists` (two real workspaces, two real physical tables, verified against real Postgres)
+* [x] Reject mutation/DDL — DELETE/DROP/UPDATE/TRUNCATE/ALTER/CREATE/INSERT/GRANT all rejected by the root-statement-type check (`test_rejects_non_select_statements`)
+* [x] Enforce result bounds — `LIMIT` injected if absent, capped if excessive, via AST rewrite (never trusts the LLM to have added one, SECURITY.md §14)
+* [x] Add extensive security tests — `tests/unit/test_sql_validator.py` (21 cases) + forbidden-function denylist (`pg_sleep`, `dblink`, `pg_read_file`, etc.) + table-valued-function-as-table rejection
 
 ---
 
 ## 5.5 Read-Only Execution
 
-* [ ] Create restricted analytics DB role
-* [ ] Execute validated SQL using restricted role
-* [ ] Configure timeout
-* [ ] Bound results
-* [ ] Normalize query output
+* [x] Create restricted analytics DB role — Alembic migration `44472a1e3a0b`: `NOLOGIN` role `opspilot_analytics_ro`, `SELECT`-only on `analytics` (present + future tables via `ALTER DEFAULT PRIVILEGES`), no privileges on `app` (ADR-032 — no second DB credential/secret, membership granted to the app's own connecting role)
+* [x] Execute validated SQL using restricted role — `infrastructure/analytics/query_executor.py::AnalyticsQueryExecutor`, `SET LOCAL ROLE` on a **dedicated** connection (never the ambient per-request session — see ADR-032's Rationale for why), always rolled back
+* [x] Configure timeout — `SET LOCAL statement_timeout`; verified against real Postgres that a `pg_sleep`-based query is actually canceled (`tests/integration/test_analytics_query_executor.py::test_query_exceeding_timeout_raises_timeout_error`)
+* [x] Bound results — `fetchmany(max_rows)` as a second, independent bound beneath the validator's injected `LIMIT`
+* [x] Normalize query output — `Decimal` -> `float`, `datetime`/`date` -> ISO string (`_normalize_value`)
+* Additional real-Postgres verification beyond the checklist: mutation attempts and `app` schema reads are rejected by the role itself even when called directly, bypassing the validator entirely (defense in depth) — `test_readonly_role_rejects_mutation_even_without_the_validator`, `test_readonly_role_cannot_read_the_app_schema`, `test_mutation_attempt_does_not_actually_delete_rows`
 
 ---
 
 ## 5.6 Analytics Tool
 
-* [ ] Implement query_database tool facade
-* [ ] Return structured results
-* [ ] Convert relevant results to evidence
-* [ ] Handle empty/error states
+* [x] Implement query_database tool facade — `application/analytics/query_database_tool.py::AnalyticsQueryService`, composing catalog -> planning -> SQL generation -> resolution -> validation (bounded retry, `ANALYTICS_MAX_SQL_GENERATION_ATTEMPTS`) -> execution. No agent exists yet (Phase 6) to call it — directly callable/tested, the same pattern Phase 4 established for `EmbeddingGenerationService`. No HTTP debug endpoint was added (API.md §16's endpoint is described as "potential"; Phase 4 did not add its RAG equivalent either — consistent precedent)
+* [x] Return structured results — `AnalyticsQueryResult` (status enum + `QueryResult` + evidence + optional interpretation)
+* [x] Convert relevant results to evidence — `application/analytics/results.py::AnalyticsEvidence` (DATA_MODEL.md §17 query-evidence shape: dataset_ids, sql, bounded result) — not yet a persisted `Evidence` row (Phase 8), same status as `RetrievalResult` in the RAG layer
+* [x] Handle empty/error states — `AnalyticsQueryStatus.{NO_DATASETS,NO_RELEVANT_DATASET,GENERATION_FAILED,EXECUTION_FAILED}`, returned structurally rather than raised (`tests/integration/test_analytics_query_service.py`)
 
 ---
 
 ## 5.7 Metrics
 
-* [ ] Implement deterministic percentage-change utility
-* [ ] Implement reusable rate calculation if justified
-* [ ] Implement revenue-impact components if justified
-* [ ] Add unit tests
+* [x] Implement deterministic percentage-change utility — `application/analytics/metrics.py::calculate_percentage_change` (absolute/relative/percentage-point, matching the documented 4%->5% example exactly)
+* [x] Implement reusable rate calculation if justified — `calculate_refund_rate`, `calculate_average_delivery_time` (reused by evaluation and, later, the agent)
+* [x] Implement revenue-impact components if justified — `calculate_revenue_impact` (exact observed + optional labeled estimate, ANALYTICS_ENGINE.md §24)
+* [x] Add unit tests — `tests/unit/test_metrics.py` (13 cases) + `calculate_metric` dispatcher (the single agent-facing entry point per AGENT_SYSTEM.md §13) with unknown-type/invalid-argument handling
 
 ---
 
 ## 5.8 Charts
 
-* [ ] Define chart specification schema
-* [ ] Convert verified analytics results to charts
-* [ ] Render frontend charts
+* [x] Define chart specification schema — `application/analytics/charts.py::ChartSpec`/`ChartSeries` (DATA_MODEL.md §23 shape)
+* [x] Convert verified analytics results to charts — `build_chart_from_result()`, a pure transform from an already-executed `QueryResult`
+* [ ] Render frontend charts — **deliberately deferred to Phase 7.** No Investigation Workspace page exists yet to host a chart (Phase 7), and Phase 4 did not build ahead of its own consumer either (no retrieval debug UI). Building chart-rendering UI now would be a disconnected component per ROADMAP.md §2 ("build vertically... prefer complete small workflows over large disconnected components").
 
 ---
 
 ## 5.9 Analytics Evaluation
 
-* [ ] Add known numerical questions
-* [ ] Compare results with ground truth
-* [ ] Test semantic equivalence rather than exact SQL text
+* [x] Add known numerical questions — reuses the existing 7 `analytics`-tagged entries in the canonical `data/northstar/eval/evaluation_questions.json` (DATASET.md §33); no separate question set created
+* [x] Compare results with ground truth — `scripts/evaluate_analytics.py`, run live against real Gemini + real Postgres: **all 7 questions executed successfully end-to-end** (no crashes, no security violations); **5/7 matched their `expected_value`** within tolerance (unit-normalized fraction-vs-percentage comparison). The 2 misses are genuine methodology differences the LLM's SQL made a different (still defensible) choice on — e.g. total refunded revenue summed all refund rows rather than only `status='completed'` ones — not pipeline defects; not fixed by hand-tuning the prompt toward this specific ground truth, per CLAUDE.md §24 ("no hardcoded investigation answers")
+* [x] Test semantic equivalence rather than exact SQL text — the evaluation compares computed numeric output, never generated SQL text, to the expected value (TESTING.md §12)
+
+**Phase 5 Analytics Engine: complete.** Catalog -> planning -> SQL generation -> identifier resolution -> AST validation -> read-only execution -> deterministic metrics -> evidence-shaped structured result, all directly callable/tested without an agent (Phase 6 wires it in). New: ADR-031 (Gemini `LLMProvider` for structured generation) and ADR-032 (sqlglot AST validation; `SET LOCAL ROLE` read-only execution). 228/228 backend tests pass (`make test-api`, full disposable-container migration cycle including the new role migration's upgrade/downgrade). Frontend chart rendering (5.8's last item) is the one item intentionally deferred to Phase 7, disclosed above rather than silently skipped.
 
 ---
 

@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack generate-northstar evaluate-retrieval
+.PHONY: up down logs migrate test-api test-infra-up test-infra-down test-web lint-web verify-stack generate-northstar evaluate-retrieval evaluate-analytics
 
 TEST_PG_CONTAINER := opspilot-test-pg
 TEST_REDIS_CONTAINER := opspilot-test-redis
@@ -56,3 +56,10 @@ generate-northstar:
 # API calls — never run as part of test-api / CI.
 evaluate-retrieval:
 	cd apps/api && . .venv/bin/activate && cd ../.. && python scripts/evaluate_retrieval.py
+
+# Live analytics evaluation (ANALYTICS_ENGINE.md §30, BACKLOG.md 5.9).
+# Requires: `make up` (dev Postgres reachable), a real GEMINI_API_KEY in
+# .env, and `make generate-northstar` already run. Makes real, paid Gemini
+# API calls — never run as part of test-api / CI.
+evaluate-analytics:
+	cd apps/api && . .venv/bin/activate && cd ../.. && python scripts/evaluate_analytics.py

@@ -1069,3 +1069,77 @@ Use **carefully constrained Gemini-generation-based reranking**:
 Identical to both the vector-only baseline and the hybrid fusion result — no metric changed. This is the same structural finding as ADR-029: Recall/MRR were already at their ceiling, and Precision@5 remains capped by the 5-chunk total corpus size, leaving no headroom for reranking (or any other stage) to demonstrate improvement.
 
 **Decision: reranking does not clear the RAG_SYSTEM.md §37 gate at Northstar's current corpus size.** `VectorSearchService` (vector-only, no reranking) remains the sole active default retrieval path. `GeminiReranker`/`RerankingService` remain in the codebase (tested, working, verified against a real live run) but are not wired into any default-path caller — available to be revisited if a larger corpus gives this comparison real headroom (see ADR-027's Consequences, which applies identically here).
+
+---
+
+# ADR-031 — LLM Generation Provider: Google Gemini (`generate_structured`/`generate`)
+
+## Context
+
+ARCHITECTURE.md §12 requires an explicit `LLMProvider` abstraction (conceptually `generate()`/`generate_structured()`/`stream()`) so business logic never depends on one vendor (ADR-015). No such abstraction existed before Phase 5: ADR-025 selected Gemini only for embeddings, and ADR-030 uses Gemini generation narrowly inside the reranker, not as a general-purpose provider callers elsewhere can use. Phase 5 is the first place natural-language business questions must drive structured AI output (BACKLOG.md 5.2 analysis intent/plan, 5.3 SQL proposal, per ADR-011) and, separately, produce a bounded natural-language interpretation of a computed result (ANALYTICS_ENGINE.md §2/§15's "Natural-Language Interpretation" step).
+
+## Decision
+
+Introduce a narrow `LLMProvider` protocol (`infrastructure/llm/base.py`) with exactly two methods:
+
+* `generate_structured(prompt, response_model) -> BaseModel` — structured JSON output validated against a caller-supplied Pydantic model, used wherever AI output drives program logic (ADR-011): analysis intent/plan (BACKLOG.md 5.2), SQL proposals (5.3).
+* `generate(prompt) -> str` — bounded free-form text, used only where output is presentation prose that does not drive control flow: result interpretation (ANALYTICS_ENGINE.md §15, "the LLM may say... but all numerical values must derive from query/calculation outputs").
+
+`stream()` is deliberately not implemented — nothing in scope through Phase 5 needs token streaming (Investigation SSE, Phase 7, streams structured *lifecycle events*, not raw LLM tokens); it is not part of this interface until a real caller needs it, matching how `EmbeddingProvider` (ADR-025) only ever implemented `embed_batch`, never the `embed_text` singular form ARCHITECTURE.md's conceptual sketch also listed.
+
+Implementation: `GeminiLLMProvider` (`infrastructure/llm/gemini_provider.py`), reusing the already-established `google-genai` SDK/vendor relationship (ADR-025/030). `generate_structured` uses the same `response_mime_type="application/json"` + `response_schema=<pydantic model>` pattern as `GeminiReranker` (ADR-030); `generate` is a plain `generate_content` call with no schema. A `FakeLLMProvider` (`infrastructure/llm/fake_provider.py`) — a scripted queue of canned responses per call — is used by all automated tests (TESTING.md §30, mirroring `FakeEmbeddingProvider`).
+
+New setting: `LLM_MODEL` (default `gemini-flash-latest`, the same rolling alias ADR-030 already uses for its own reasons — avoids pinning a dated snapshot that Google can retire mid-project).
+
+## Rationale
+
+* Reuses the existing Gemini vendor relationship and SDK rather than introducing a third AI vendor for one more capability (same reasoning ADR-025/030 already applied).
+* A two-method interface (not the full three-method sketch) matches CLAUDE.md §15 ("avoid speculative abstractions") and the project's own precedent (`EmbeddingProvider`) of implementing only the subset of a conceptual interface that has a real caller.
+* Keeping `generate_structured` and `generate` as separate methods (rather than one method with an optional schema) makes ADR-011's structured-vs-free-text distinction visible at every call site, not just a runtime flag.
+
+## Alternatives
+
+* **OpenAI or Anthropic for generation only, Gemini for embeddings:** rejected — splits the AI vendor surface in two for no benefit; ADR-025 already established Gemini generation works well for structured output (ADR-030 already relies on it).
+* **A single `generate(prompt, response_model: type[BaseModel] | None = None)` method:** rejected — collapses ADR-011's structured/free-text distinction into a runtime parameter instead of the call site itself, making it harder to audit "does this AI output drive program logic" by reading signatures alone.
+
+## Consequences
+
+* `apps/api/pyproject.toml`/`.env.example` gain no new dependency (`google-genai` already present per ADR-025) beyond the new `LLM_MODEL` setting.
+* Any future Phase 6 agent orchestration reasoning call is expected to reuse this same `LLMProvider`, not introduce a second one, unless a concrete need (e.g. streaming) forces `stream()` to be added then.
+
+---
+
+# ADR-032 — SQL AST Parsing (`sqlglot`) and Read-Only Analytics Execution via `SET LOCAL ROLE`
+
+## Context
+
+BACKLOG.md 5.4/5.5 require an AST-based SQL validator (SECURITY.md §11: "prefer parsing SQL into an AST... rather than regex-only checks") and a restricted read-only database role for AI-generated analytical SQL (ADR-008, SECURITY.md §8/§12). Two concrete choices were needed: which SQL parsing library to use, and how the "restricted role" requirement is actually wired into query execution without inventing a second database credential/secret.
+
+## Decision
+
+**SQL parsing/validation:** use [`sqlglot`](https://github.com/tobymao/sqlglot), a pure-Python, dependency-free SQL parser supporting the Postgres dialect. Used for two distinct, separately-testable passes:
+
+1. **Identifier resolution** (`infrastructure/analytics/sql_resolver.py`): the LLM is shown only display names (ANALYTICS_ENGINE.md §5); after generation, `sqlglot` rewrites every `Table`/`Column` AST node whose name matches a known display name in the requesting workspace's catalog to its corresponding `analytics.<physical_table_name>`/`<physical_name>` identifier (ADR-017). Any identifier that does not resolve raises `SqlResolutionError` — the query is never executed with a partially-resolved or literal display name.
+2. **Validation** (`infrastructure/analytics/sql_validator.py`), run only on the already-resolved (physical-identifier) SQL: exactly one statement (reject `;`-stacked statements, SECURITY.md §12), root statement must be `SELECT`/`WITH ... SELECT` (SECURITY.md §10), every referenced table must be in the dynamically-built, workspace-scoped physical-table allowlist (ADR-017) and the `analytics` schema (never `app`, SECURITY.md §13), a small denylist of resource-exhaustion/file/network functions is rejected (e.g. `pg_sleep`, `dblink`, `pg_read_file`, `lo_import`, `copy_from_program`), and a `LIMIT` is enforced by rewriting the AST (capping any existing `LIMIT` to the configured maximum, or adding one if absent) rather than trusting the LLM to have added one (SECURITY.md §14).
+
+**Read-only execution role:** a `NOLOGIN` Postgres role (`opspilot_analytics_ro`) is created by migration, granted `USAGE` on the `analytics` schema and `SELECT` on all its tables (present and future, via `ALTER DEFAULT PRIVILEGES`), with no privileges on `app` whatsoever. The role has no password and is never a second connection credential/secret. Instead, `AnalyticsQueryExecutor` opens a **dedicated connection** (never the ambient per-request `AsyncSession` used elsewhere — see Rationale), begins an explicit transaction, runs `SET LOCAL ROLE opspilot_analytics_ro` + `SET LOCAL statement_timeout`, executes the validated query, and always rolls back (read-only, so commit vs. rollback is semantically equivalent, and rollback guarantees the connection returns to the pool with the role/timeout fully unset for the next borrower).
+
+## Rationale
+
+* `sqlglot` needs no database connection or native extension (pure Python), matches SECURITY.md §11's explicit ask for AST-based (not regex) validation, and is mature enough to support two independent passes (rename, then validate) over the same grammar without a second parser.
+* Splitting "resolve display→physical" from "validate" into two passes over two different SQL strings (LLM's display-name SQL, then the fully-physical SQL) keeps each pass's job small and independently testable — resolution failures (unknown identifier) and validation failures (disallowed statement/table/function) are distinguishable error states, which matters for ANALYTICS_ENGINE.md §28's bounded-retry-with-feedback flow.
+* `SET LOCAL ROLE` on a dedicated connection avoids provisioning, securing, and rotating a second database credential (a new secret per SECURITY.md §7) for a role that never needs its own login. Reusing the ambient request-scoped `AsyncSession` (as `table_builder.py` does for ingestion DDL) was considered and rejected specifically because `SET LOCAL` only reverts at transaction end — the ambient session's transaction spans the whole HTTP request, so any later query on that same session after an analytics call would silently keep running as the restricted role (or, worse, the restriction would leak backwards if ordering ever changed). A dedicated connection with an explicit, always-rolled-back transaction has no such leakage window.
+* Even if SQL validation had a bug that let a disallowed statement or table through, the role's Postgres-enforced privileges (SELECT-only, `analytics`-only) independently block it — true defense in depth (SECURITY.md's "multiple layers" principle), not reliance on the validator alone.
+
+## Alternatives
+
+* **A second database credential/connection string for a login-capable read-only role:** rejected — a real login role needs a password (a new secret, SECURITY.md §7) and a second pool to manage, for no capability `SET LOCAL ROLE` on a `NOLOGIN` role doesn't already provide.
+* **Regex-based SQL validation:** rejected outright by SECURITY.md §11 itself.
+* **`pglast` (libpg_query bindings) instead of `sqlglot`:** a reasonable alternative that parses actual Postgres grammar via the real Postgres parser; not selected because it requires a compiled C extension (heavier dependency footprint) where `sqlglot`'s pure-Python Postgres dialect support is sufficient for this project's validation needs (single-statement, table/function-name-level checks — not exhaustive Postgres grammar coverage).
+* **Skipping identifier resolution and letting the LLM see physical identifiers directly:** rejected — ANALYTICS_ENGINE.md §5 explicitly settles this: "the LLM only ever sees the display names... SQL generation resolves them to physical identifiers."
+
+## Consequences
+
+* `apps/api/pyproject.toml` gains `sqlglot` as a core dependency.
+* New Alembic migration creates `opspilot_analytics_ro` and grants role membership to the application's own connecting user via `GRANT opspilot_analytics_ro TO CURRENT_USER`, so the migration does not need to know the configured `POSTGRES_USER` value literally.
+* Any future analytical execution path (Phase 6 agent, Phase 10 evaluation) must go through `AnalyticsQueryExecutor`, never open its own ad hoc connection to run AI-influenced SQL — this is the single enforced choke point the role/timeout/rollback guarantees apply to.

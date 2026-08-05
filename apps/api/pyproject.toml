@@ -24,6 +24,8 @@ dependencies = [
     "google-genai>=0.3",
     # Background job queue for embedding generation (Phase 4, ADR-024/ADR-026).
     "arq>=0.26",
+    # AST-based SQL parsing/validation for the analytics engine (Phase 5, ADR-032).
+    "sqlglot>=25",
 ]
 
 [project.optional-dependencies]
